@@ -1,4 +1,5 @@
-# webhook_bot.py — Telegram бот на aiogram 3.x с webhook (Render Free Web Service)
+# webhook_bot.py — Telegram-бот на aiogram 3.x через webhook (для Render Free Web Service)
+# Команды: /start /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off /reload_csv
 
 import os
 import asyncio
@@ -21,27 +22,29 @@ from apscheduler.triggers.cron import CronTrigger
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# ------------ Конфиги из окружения ------------
+# ---------- ENV ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env is empty")
+    raise RuntimeError("Env BOT_TOKEN is empty")
 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # путь/секрет в URL
-BASE_URL = os.getenv("BASE_URL")  # например: https://school-bot-xxxx.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")   # любой безопасный ключ без пробелов
+BASE_URL = os.getenv("BASE_URL")                             # https://<твой-сервис>.onrender.com
 
-SCHEDULE_CSV = "personal_schedule_all.csv"
-DEFAULT_TZ = "Europe/Moscow"
+SCHEDULE_CSV   = "personal_schedule_all.csv"
+DEFAULT_TZ     = "Europe/Moscow"
 REMIND_BEFORE_MIN = 10
-ADMIN_IDS = set()  # сюда свой tg id, если нужна /reload_csv
+ADMIN_IDS = set()  # можно добавить свой Telegram ID (int), чтобы работала /reload_csv
 
+# ---------- LOG ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
 
+# ---------- CORE ----------
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# ------------ Клавиатура ------------
+# ---------- UI ----------
 def main_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -52,7 +55,7 @@ def main_kb():
         resize_keyboard=True,
     )
 
-# ------------ Расписание в памяти ------------
+# ---------- DATA (CSV in RAM) ----------
 PERSONAL = []
 DAY_MAP = {"Mon":"Пн","Tue":"Вт","Wed":"Ср","Thu":"Чт","Fri":"Пт","Sat":"Сб","Sun":"Вс"}
 
@@ -71,7 +74,7 @@ def personal_for(full_name: str, day_ru: str):
         key=lambda r: r["урок"]
     )
 
-# ------------ БД ------------
+# ---------- DB ----------
 DB = "school_bot.db"
 def db(): return sqlite3.connect(DB)
 
@@ -84,8 +87,7 @@ def init_db():
           full_name TEXT NOT NULL,
           timezone TEXT DEFAULT '{DEFAULT_TZ}',
           notify_enabled INTEGER DEFAULT 1
-        );
-        """)
+        );""")
 
 def get_user(tg_id: int):
     with closing(db()) as conn, conn:
@@ -111,7 +113,7 @@ def set_timezone(tg_id:int, tz:str):
     with closing(db()) as conn, conn:
         conn.execute("UPDATE users SET timezone=? WHERE tg_id=?", (tz, tg_id))
 
-# ------------ Рендер текста ------------
+# ---------- RENDER ----------
 def fmt_lesson(r:dict)->str:
     return f"<b>{r['начало']}-{r['конец']}</b> • {r['предмет']}"
 
@@ -136,7 +138,7 @@ def render_week(full_name:str, base_day:date, tz:ZoneInfo)->str:
             lines += ["  • " + fmt_lesson(r) for r in rows]
     return "\n".join(lines)
 
-# ------------ Напоминания ------------
+# ---------- NOTIFY ----------
 async def send(tg_id:int, text:str):
     try:
         await bot.send_message(tg_id, text)
@@ -157,16 +159,15 @@ def schedule_daily_jobs():
         for r in rows:
             hh, mm = map(int, r["начало"].split(":"))
             dt = datetime.combine(today_local, time(hh, mm), tzinfo)
-            remind_at = dt - timedelta(minutes=10)
+            remind_at = dt - timedelta(minutes=REMIND_BEFORE_MIN)
             if remind_at > now:
                 trig = CronTrigger(year=remind_at.year, month=remind_at.month, day=remind_at.day,
                                    hour=remind_at.hour, minute=remind_at.minute, second=0, timezone=tzinfo)
-                text = f"🔔 Скоро урок: <b>{r['предмет']}</b> в {r['начало']} (через 10 мин)"
+                text = f"🔔 Скоро урок: <b>{r['предмет']}</b> в {r['начало']} (через {REMIND_BEFORE_MIN} мин)"
                 scheduler.add_job(send, trigger=trig, args=[tg_id, text])
-        # ежедневный пересчёт локально
         scheduler.add_job(schedule_daily_jobs, trigger=CronTrigger(hour=0, minute=5, timezone=tzinfo))
 
-# ------------ Команды/обработчики ------------
+# ---------- HANDLERS ----------
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
     u = get_user(m.from_user.id)
@@ -188,14 +189,12 @@ async def register_by_name(m: Message):
         await m.answer("Не нашёл такое ФИО 🙈 Попробуй ещё раз (точно как в журнале).")
         return
     upsert_user(m.from_user.id, name)
-    await m.answer("Нашёл! 👋 Привет, <b>%s</b>.\nКоманды: /today /tomorrow /week" % name, reply_markup=main_kb())
+    await m.answer(f"Нашёл! 👋 Привет, <b>{name}</b>.\nКоманды: /today /tomorrow /week", reply_markup=main_kb())
 
 @dp.message(Command("whoami"))
 async def whoami(m: Message):
     u = get_user(m.from_user.id)
-    if not u:
-        await m.answer("Ты ещё не зарегистрирован.")
-        return
+    if not u: return await m.answer("Ты ещё не зарегистрирован.")
     await m.answer(f"<b>Ты</b>: {u['full_name']}\nЧасовой пояс: {u['timezone']}\n"
                    f"Уведомления: {'вкл' if u['notify_enabled'] else 'выкл'}")
 
@@ -253,7 +252,7 @@ async def buttons_router(m: Message):
     elif t=="🔔 Вкл": await notify_on(m)
     elif t=="🔕 Выкл": await notify_off(m)
 
-# ------------ Webhook (aiohttp) ------------
+# ---------- WEBHOOK (aiohttp) ----------
 async def on_startup():
     init_db()
     load_personal_csv()
@@ -261,22 +260,24 @@ async def on_startup():
     scheduler.start()
 
     if not BASE_URL:
-        logger.warning("BASE_URL не задан. Задай env BASE_URL=полный_адрес_сервиса и перезапусти, чтобы включить вебхук.")
+        logger.warning("BASE_URL не задан. Задай env BASE_URL=полный_адрес_сервиса и сделай redeploy.")
         return
 
     webhook_url = f"{BASE_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
-    # снимаем старый и ставим новый вебхук
+    # ВАЖНО: секрет передаём в set_webhook, иначе Telegram не пришлёт заголовок и будет 401
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(url=webhook_url)
+    await bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
     logger.info(f"Webhook set to: {webhook_url}")
 
 async def on_shutdown(app: web.Application):
-    await bot.session.close()
-    scheduler.shutdown(wait=False)
+    try:
+        await bot.session.close()
+    finally:
+        scheduler.shutdown(wait=False)
 
 def create_app() -> web.Application:
     app = web.Application()
-    # регистрируем обработчик вебхука
+    # Обработчик входящих обновлений с проверкой секретного токена
     SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(
         app, path=f"/webhook/{WEBHOOK_SECRET}"
     )
@@ -286,4 +287,5 @@ def create_app() -> web.Application:
     return app
 
 if __name__ == "__main__":
+    # Render пробрасывает PORT в env; дефолт — 10000
     web.run_app(create_app(), host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
