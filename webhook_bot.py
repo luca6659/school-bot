@@ -5,6 +5,7 @@
 # ✔ Команды: /start /logout /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off /reload
 # ✔ Уведомления: утром 08:00 по личному TZ + напоминания за 10 минут до урока
 # ✔ «Умный» ввод ФИО: нормализация + подсказки по похожим именам
+# ✔ FIX: NOT NULL для full_name (первичная запись с "")
 
 import os
 import asyncio
@@ -38,7 +39,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BASE_URL = os.getenv("BASE_URL")  # https://<твой-сервис>.onrender.com
 
 SCHEDULE_CSV      = "personal_schedule_all.csv"  # Файл с личными расписаниями
-DEFAULT_TZ        = "Europe/Moscow"
+DEFAULT_TZ        = "Europe/Zagreb"              # твоя TZ по умолчанию
 REMIND_BEFORE_MIN = 10
 
 # ---------- LOG ----------
@@ -113,9 +114,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           tg_id INTEGER UNIQUE NOT NULL,
-          full_name TEXT,
-          timezone TEXT DEFAULT '{DEFAULT_TZ}',
-          notify_enabled INTEGER DEFAULT 1
+          full_name TEXT NOT NULL DEFAULT '',
+          timezone TEXT NOT NULL DEFAULT '{DEFAULT_TZ}',
+          notify_enabled INTEGER NOT NULL DEFAULT 1
         );
         """)
 
@@ -130,13 +131,17 @@ def get_user(tg_id: int):
                 "notify_enabled":bool(row[3])}
 
 def ensure_user(tg_id:int):
+    """FIX: если таблица старая с NOT NULL для full_name — вставляем пустую строку."""
     if not get_user(tg_id):
         with closing(db()) as conn, conn:
-            conn.execute("INSERT INTO users(tg_id) VALUES(?)", (tg_id,))
+            conn.execute(
+                "INSERT INTO users(tg_id, full_name, timezone, notify_enabled) VALUES(?, ?, ?, ?)",
+                (tg_id, "", DEFAULT_TZ, 1)
+            )
 
 def set_full_name(tg_id:int, full_name:str|None):
     with closing(db()) as conn, conn:
-        conn.execute("UPDATE users SET full_name=? WHERE tg_id=?", (full_name, tg_id))
+        conn.execute("UPDATE users SET full_name=? WHERE tg_id=?", (full_name or "", tg_id))
 
 def set_notify(tg_id:int, enabled:bool):
     with closing(db()) as conn, conn:
@@ -189,8 +194,10 @@ def schedule_daily_jobs():
     scheduler.add_job(schedule_daily_jobs, trigger=CronTrigger(hour=0, minute=5, timezone="UTC"))
 
     for tg_id, full_name, tz, enabled in users:
-        if not full_name:
+        # пустое имя ("") = не зарегистрирован
+        if not full_name or not full_name.strip():
             continue
+
         tzinfo = ZoneInfo(tz or DEFAULT_TZ)
 
         # Утренняя рассылка 08:00 локального времени — ежедневный cron
@@ -222,7 +229,8 @@ def schedule_daily_jobs():
 
 # ---------- Гварды ----------
 def guard_or_msg(u):
-    if not u or not u["full_name"]:
+    # FIX: пустая строка имени считается незарегистрированным состоянием
+    if not u or not u["full_name"] or not u["full_name"].strip():
         return ("👋 Привет! Напиши свои <b>имя и фамилию</b> (как в списке), "
                 "чтобы я показал твоё личное расписание.")
     return None
@@ -239,7 +247,7 @@ async def reload_cmd(m: Message):
 async def start_cmd(m: Message):
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
-    if u and u["full_name"]:
+    if u and u["full_name"] and u["full_name"].strip():
         return await m.answer(
             f"Ты уже в системе как <b>{u['full_name']}</b> ✅\n"
             "Команды: /today /tomorrow /week /whoami /notify_on /notify_off /logout",
@@ -254,7 +262,7 @@ async def start_cmd(m: Message):
 @dp.message(Command("logout"))
 async def logout_cmd(m: Message):
     ensure_user(m.from_user.id)
-    set_full_name(m.from_user.id, None)
+    set_full_name(m.from_user.id, None)   # запишется "" по нашему сеттеру
     set_notify(m.from_user.id, False)
     schedule_daily_jobs()
     await m.answer(
@@ -265,7 +273,7 @@ async def logout_cmd(m: Message):
 @dp.message(Command("whoami"))
 async def whoami(m: Message):
     u = get_user(m.from_user.id)
-    if not u or not u["full_name"]:
+    if not u or not u["full_name"] or not u["full_name"].strip():
         return await m.answer("Ты пока не зарегистрирован. Пришли свои ФИО.")
     await m.answer(
         f"<b>Ты</b>: {u['full_name']}\n"
