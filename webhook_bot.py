@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-# webhook_bot.py — Telegram-бот (aiogram 3.x) для Render (Web Service)
-# Доступ без пароля: при /start бот просит ФИО (как в CSV) и регистрирует.
-# Команды: /start /logout /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off
-# Кнопки: Сегодня / Завтра / Неделя / Мой профиль / 🔔 Вкл / 🔕 Выкл / 🚪 Выйти
-# Уведомления: утреннее 08:00 + за 10 минут до урока (по личному TZ).
+# Telegram-бот (aiogram 3.x) для Render (Web Service)
+# ✔ Без пароля: /start просит ФИО (как в CSV) и регистрирует
+# ✔ Кнопки: Сегодня / Завтра / Неделя / Мой профиль / 🔔 Вкл / 🔕 Выкл / 🚪 Выйти
+# ✔ Команды: /start /logout /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off /reload
+# ✔ Уведомления: утром 08:00 по личному TZ + напоминания за 10 минут до урока
+# ✔ «Умный» ввод ФИО: нормализация + подсказки по похожим именам
 
 import os
 import asyncio
 import logging
 import csv
 import sqlite3
+import difflib
 from contextlib import closing
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
@@ -25,6 +27,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 # ---------- ENV ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -34,7 +37,7 @@ if not BOT_TOKEN:
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BASE_URL = os.getenv("BASE_URL")  # https://<твой-сервис>.onrender.com
 
-SCHEDULE_CSV      = "personal_schedule_all.csv"
+SCHEDULE_CSV      = "personal_schedule_all.csv"  # Файл с личными расписаниями
 DEFAULT_TZ        = "Europe/Moscow"
 REMIND_BEFORE_MIN = 10
 
@@ -68,14 +71,15 @@ def main_kb():
         resize_keyboard=True,
     )
 
-# ---------- CSV расписание в памяти ----------
+# ---------- CSV расписание ----------
 PERSONAL = []
+ALL_NAMES = []  # список всех ФИО для подсказок
 DAY_MAP = {"Mon":"Пн","Tue":"Вт","Wed":"Ср","Thu":"Чт","Fri":"Пт","Sat":"Сб","Sun":"Вс"}
 
 def load_personal_csv():
-    """Читает CSV в оперативку. Формат: ФИО,день,урок,начало,конец,класс-столбец,предмет"""
-    global PERSONAL
-    PERSONAL = []
+    """Читает CSV в память. Формат: ФИО,день,урок,начало,конец,класс-столбец,предмет"""
+    global PERSONAL, ALL_NAMES
+    PERSONAL, ALL_NAMES = [], []
     with open(SCHEDULE_CSV, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             row["урок"] = int(row["урок"])
@@ -84,7 +88,8 @@ def load_personal_csv():
             row["класс-столбец"] = row["класс-столбец"].strip()
             row["предмет"] = row["предмет"].strip()
             PERSONAL.append(row)
-    logger.info(f"Загружено {len(PERSONAL)} строк из {SCHEDULE_CSV}")
+    ALL_NAMES = sorted({r["ФИО"] for r in PERSONAL})
+    logger.info(f"Загружено {len(PERSONAL)} строк из {SCHEDULE_CSV}; уникальных ФИО: {len(ALL_NAMES)}")
 
 def personal_for(full_name: str, day_ru: str):
     rows = [r for r in PERSONAL if r["ФИО"].lower()==full_name.lower() and r["день"]==day_ru]
@@ -94,6 +99,9 @@ def personal_for(full_name: str, day_ru: str):
 def strata_of_student(full_name: str):
     st = {r["класс-столбец"] for r in PERSONAL if r["ФИО"].lower()==full_name.lower()}
     return ", ".join(sorted(st)) or "—"
+
+def normalize_name(s: str) -> str:
+    return " ".join(s.strip().split()).lower()
 
 # ---------- DB ----------
 DB = "school_bot.db"
@@ -177,64 +185,71 @@ def schedule_daily_jobs():
     with closing(db()) as conn, conn:
         users = conn.execute("SELECT tg_id, full_name, timezone, notify_enabled FROM users").fetchall()
 
+    # ежедневная перестройка (на случай смены TZ/имени)
+    scheduler.add_job(schedule_daily_jobs, trigger=CronTrigger(hour=0, minute=5, timezone="UTC"))
+
     for tg_id, full_name, tz, enabled in users:
-        if not full_name:  # не зарегистрирован — пропускаем
+        if not full_name:
             continue
         tzinfo = ZoneInfo(tz or DEFAULT_TZ)
 
-        # Утренняя рассылка 08:00 местного времени
+        # Утренняя рассылка 08:00 локального времени — ежедневный cron
         if enabled:
-            morning = datetime.now(tzinfo).replace(hour=8, minute=0, second=0, microsecond=0)
-            if morning < datetime.now(tzinfo):
-                morning += timedelta(days=1)
-            trig_morning = CronTrigger(
-                year=morning.year, month=morning.month, day=morning.day,
-                hour=morning.hour, minute=morning.minute, second=0, timezone=tzinfo
+            scheduler.add_job(
+                func=lambda chat_id=tg_id, fio=full_name, tzinfo=tzinfo: asyncio.create_task(
+                    send(chat_id, f"🌞 Доброе утро, <b>{fio}</b>!\n" + render_day(fio, datetime.now(tzinfo).date(), tzinfo))
+                ),
+                trigger=CronTrigger(hour=8, minute=0, timezone=tzinfo),
+                name=f"morning_{tg_id}"
             )
-            async def morning_msg(chat_id=tg_id, fio=full_name, tzinfo=tzinfo):
-                today = datetime.now(tzinfo).date()
-                await send(chat_id, f"🌞 Доброе утро, <b>{fio}</b>!\n" + render_day(fio, today, tzinfo))
-            scheduler.add_job(morning_msg, trigger=trig_morning)
 
-        # Напоминания за 10 минут (только сегодня)
-        if enabled and full_name:
+            # Напоминания «сегодня» — одноразовые даты
             today_local = datetime.now(tzinfo).date()
             day_ru = DAY_MAP[datetime.now(tzinfo).strftime("%a")]
             rows = personal_for(full_name, day_ru)
             now_local = datetime.now(tzinfo)
             for r in rows:
                 hh, mm = map(int, r["начало"].split(":"))
-                dt = datetime.combine(today_local, time(hh, mm), tzinfo)
-                remind_at = dt - timedelta(minutes=REMIND_BEFORE_MIN)
+                start_dt = datetime.combine(today_local, time(hh, mm), tzinfo)
+                remind_at = start_dt - timedelta(minutes=REMIND_BEFORE_MIN)
                 if remind_at > now_local:
-                    trig = CronTrigger(year=remind_at.year, month=remind_at.month, day=remind_at.day,
-                                       hour=remind_at.hour, minute=remind_at.minute, second=0, timezone=tzinfo)
-                    text = f"🔔 Скоро урок: <b>{r['предмет']}</b> в {r['начало']} — {r['класс-столбец']}"
-                    scheduler.add_job(send, trigger=trig, args=[tg_id, text])
-
-    # Перестраиваем каждый день в 00:05 UTC
-    scheduler.add_job(schedule_daily_jobs, trigger=CronTrigger(hour=0, minute=5, timezone="UTC"))
+                    scheduler.add_job(
+                        func=lambda chat_id=tg_id, subj=r['предмет'], st=r['начало'], col=r['класс-столбец']:
+                            asyncio.create_task(send(chat_id, f"🔔 Скоро урок: <b>{subj}</b> в {st} — {col}")),
+                        trigger=DateTrigger(run_date=remind_at),
+                        name=f"remind_{tg_id}_{r['предмет']}_{r['начало']}"
+                    )
 
 # ---------- Гварды ----------
 def guard_or_msg(u):
     if not u or not u["full_name"]:
-        return "👋 Привет! Напиши свои <b>имя и фамилию</b> (как в списке), чтобы я нашёл твоё расписание."
+        return ("👋 Привет! Напиши свои <b>имя и фамилию</b> (как в списке), "
+                "чтобы я показал твоё личное расписание.")
     return None
 
 def tz_for(u): return ZoneInfo(u["timezone"] or DEFAULT_TZ)
 
-# ---------- Хендлеры ----------
+# ---------- Команды ----------
+@dp.message(Command("reload"))
+async def reload_cmd(m: Message):
+    load_personal_csv()
+    await m.answer("CSV перечитан ✅")
+
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
     if u and u["full_name"]:
-        return await m.answer("Ты уже зарегистрирован ✅", reply_markup=main_kb())
-    await m.answer(
-        "Привет! Этот бот показывает твоё личное расписание.\n"
-        "Напиши свои <b>имя и фамилию</b> ровно как в списке (пример: <i>Голованова Диана</i>).",
-        reply_markup=main_kb()
-    )
+        return await m.answer(
+            f"Ты уже в системе как <b>{u['full_name']}</b> ✅\n"
+            "Команды: /today /tomorrow /week /whoami /notify_on /notify_off /logout",
+            reply_markup=main_kb()
+        )
+    hint = "Напиши свои <b>имя и фамилию</b> ровно как в списке (пример: <i>Абдуллаев Абдула</i>)."
+    sample = ""
+    if ALL_NAMES:
+        sample = "\n\nПримеры из списка:\n• " + "\n• ".join(ALL_NAMES[:6])
+    await m.answer("Привет! Я покажу твоё личное расписание.\n" + hint + sample, reply_markup=main_kb())
 
 @dp.message(Command("logout"))
 async def logout_cmd(m: Message):
@@ -289,11 +304,10 @@ async def week_cmd(m: Message):
 
 @dp.message(Command("set_timezone"))
 async def set_tz(m: Message):
-    u = get_user(m.from_user.id)
     ensure_user(m.from_user.id)
     parts = (m.text or "").split(maxsplit=1)
     if len(parts)==1:
-        return await m.answer("Пример: /set_timezone Europe/Moscow")
+        return await m.answer("Пример: /set_timezone Europe/Zagreb")
     tz = parts[1].strip()
     try:
         ZoneInfo(tz)
@@ -332,24 +346,38 @@ async def buttons_router(m: Message):
     if m.text == BTN_OFF:      return await notify_off(m)
     if m.text == BTN_LOGOUT:   return await logout_cmd(m)
 
-# ---- Регистрация ФИО (текст) — НЕ перехватываем команды и кнопки ----
+# ---- Регистрация ФИО (умная) — НЕ перехватываем команды и кнопки ----
 @dp.message(
     F.text,
-    ~Command(commands={"start","logout","today","tomorrow","week","whoami","set_timezone","notify_on","notify_off"}),
+    ~Command(commands={"start","logout","today","tomorrow","week","whoami","set_timezone","notify_on","notify_off","reload"}),
     ~F.text.in_(BUTTON_SET)
 )
 async def register_name(m: Message):
     ensure_user(m.from_user.id)
-    name = (m.text or "").strip()
-    found = any(r for r in PERSONAL if r["ФИО"].lower()==name.lower())
-    if not found:
-        return await m.answer("Не нашёл такое ФИО 🙈 Проверь написание и пришли ещё раз.")
-    set_full_name(m.from_user.id, name)
-    schedule_daily_jobs()
-    await m.answer(
-        f"Нашёл! 👋 Привет, <b>{name}</b>.\nКоманды: /today /tomorrow /week",
-        reply_markup=main_kb()
-    )
+    raw = (m.text or "").strip()
+    if not raw:
+        return await m.answer("Пришли, пожалуйста, свои имя и фамилию.")
+
+    want = normalize_name(raw)
+    exact = next((n for n in ALL_NAMES if normalize_name(n) == want), None)
+
+    if exact:
+        set_full_name(m.from_user.id, exact)
+        schedule_daily_jobs()
+        return await m.answer(
+            f"Нашёл! 👋 Привет, <b>{exact}</b>.\nКоманды: /today /tomorrow /week",
+            reply_markup=main_kb()
+        )
+
+    tips = difflib.get_close_matches(raw, ALL_NAMES, n=5, cutoff=0.5)
+    if tips:
+        lines = "\n".join(f"• {t}" for t in tips)
+        return await m.answer(
+            "Не нашёл такое ФИО 🙈\nВозможно, ты имел в виду:\n" + lines + "\n\n"
+            "Скопируй подходящее и пришли ещё раз."
+        )
+
+    await m.answer("Не нашёл такое ФИО 🙈 Проверь написание и пришли ещё раз (как в списке).")
 
 # ---------- WEBHOOK (aiohttp) ----------
 async def on_startup():
