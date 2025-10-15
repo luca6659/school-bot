@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 # webhook_bot.py — Telegram-бот (aiogram 3.x) для Render (Web Service)
-# Доступ только для своих: ACCESS_CODE + проверка ФИО в CSV.
-# Команды: /start /code /reset /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off
-# Кнопки: Сегодня / Завтра / Неделя / Мой профиль / 🔔 Вкл / 🔕 Выкл
-# Функции: утреннее расписание в 08:00 (по личному TZ) + напоминания за 10 минут до урока.
+# Доступ без пароля: при /start бот просит ФИО (как в CSV) и регистрирует.
+# Команды: /start /logout /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off
+# Кнопки: Сегодня / Завтра / Неделя / Мой профиль / 🔔 Вкл / 🔕 Выкл / 🚪 Выйти
+# Уведомления: утреннее 08:00 + за 10 минут до урока (по личному TZ).
 
 import os
 import asyncio
@@ -23,10 +23,6 @@ from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# FSM (для ввода кода)
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -37,9 +33,6 @@ if not BOT_TOKEN:
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BASE_URL = os.getenv("BASE_URL")  # https://<твой-сервис>.onrender.com
-ACCESS_CODE = os.getenv("ACCESS_CODE", "").strip()
-if not ACCESS_CODE:
-    raise RuntimeError("Env ACCESS_CODE is empty (set it in Render)")
 
 SCHEDULE_CSV      = "personal_schedule_all.csv"
 DEFAULT_TZ        = "Europe/Moscow"
@@ -51,7 +44,7 @@ logger = logging.getLogger("bot")
 
 # ---------- CORE ----------
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()  # встроенное in-memory FSM здесь же
+dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
 # ---------- UI ----------
@@ -61,7 +54,8 @@ BTN_WEEK = "Неделя"
 BTN_PROFILE = "Мой профиль"
 BTN_ON = "🔔 Вкл"
 BTN_OFF = "🔕 Выкл"
-BUTTON_SET = {BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_PROFILE, BTN_ON, BTN_OFF}
+BTN_LOGOUT = "🚪 Выйти"
+BUTTON_SET = {BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_PROFILE, BTN_ON, BTN_OFF, BTN_LOGOUT}
 
 def main_kb():
     return ReplyKeyboardMarkup(
@@ -69,6 +63,7 @@ def main_kb():
             [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW)],
             [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_PROFILE)],
             [KeyboardButton(text=BTN_ON), KeyboardButton(text=BTN_OFF)],
+            [KeyboardButton(text=BTN_LOGOUT)],
         ],
         resize_keyboard=True,
     )
@@ -112,51 +107,28 @@ def init_db():
           tg_id INTEGER UNIQUE NOT NULL,
           full_name TEXT,
           timezone TEXT DEFAULT '{DEFAULT_TZ}',
-          notify_enabled INTEGER DEFAULT 1,
-          verified INTEGER DEFAULT 0
+          notify_enabled INTEGER DEFAULT 1
         );
         """)
-        # мягкие миграции
-        try: conn.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0;")
-        except Exception: pass
-        try: conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT;")
-        except Exception: pass
 
 def get_user(tg_id: int):
     with closing(db()) as conn, conn:
         row = conn.execute(
-            "SELECT tg_id, full_name, timezone, notify_enabled, verified FROM users WHERE tg_id=?",
+            "SELECT tg_id, full_name, timezone, notify_enabled FROM users WHERE tg_id=?",
             (tg_id,)
         ).fetchone()
         if not row: return None
         return {"tg_id":row[0],"full_name":row[1],"timezone":row[2],
-                "notify_enabled":bool(row[3]), "verified":bool(row[4])}
+                "notify_enabled":bool(row[3])}
 
-def user_exists(tg_id: int) -> bool:
-    with closing(db()) as conn, conn:
-        (n,) = conn.execute("SELECT COUNT(1) FROM users WHERE tg_id=? AND verified=1", (tg_id,)).fetchone()
-        return n>0
+def ensure_user(tg_id:int):
+    if not get_user(tg_id):
+        with closing(db()) as conn, conn:
+            conn.execute("INSERT INTO users(tg_id) VALUES(?)", (tg_id,))
 
-def add_or_update_user(tg_id:int, full_name:str|None=None, tz:str|None=None, verified:bool|None=None):
+def set_full_name(tg_id:int, full_name:str|None):
     with closing(db()) as conn, conn:
-        cur = conn.execute("SELECT tg_id FROM users WHERE tg_id=?", (tg_id,)).fetchone()
-        if cur:
-            conn.execute("""
-                UPDATE users
-                   SET full_name=COALESCE(?, full_name),
-                       timezone=COALESCE(?, timezone),
-                       verified=COALESCE(?, verified)
-                 WHERE tg_id=?
-            """, (full_name, tz, (1 if verified else 0) if verified is not None else None, tg_id))
-        else:
-            conn.execute("""
-                INSERT INTO users(tg_id, full_name, timezone, verified)
-                VALUES(?,?,?,?)
-            """, (tg_id, full_name or None, tz or DEFAULT_TZ, 1 if verified else 0))
-
-def set_verified(tg_id:int, flag:bool):
-    with closing(db()) as conn, conn:
-        conn.execute("UPDATE users SET verified=? WHERE tg_id=?", (1 if flag else 0, tg_id))
+        conn.execute("UPDATE users SET full_name=? WHERE tg_id=?", (full_name, tg_id))
 
 def set_notify(tg_id:int, enabled:bool):
     with closing(db()) as conn, conn:
@@ -203,10 +175,10 @@ async def send(tg_id:int, text:str):
 def schedule_daily_jobs():
     scheduler.remove_all_jobs()
     with closing(db()) as conn, conn:
-        users = conn.execute("SELECT tg_id, full_name, timezone, notify_enabled, verified FROM users").fetchall()
+        users = conn.execute("SELECT tg_id, full_name, timezone, notify_enabled FROM users").fetchall()
 
-    for tg_id, full_name, tz, enabled, verified in users:
-        if not verified:  # не прошёл код — не беспокоим
+    for tg_id, full_name, tz, enabled in users:
+        if not full_name:  # не зарегистрирован — пропускаем
             continue
         tzinfo = ZoneInfo(tz or DEFAULT_TZ)
 
@@ -224,7 +196,7 @@ def schedule_daily_jobs():
                 await send(chat_id, f"🌞 Доброе утро, <b>{fio}</b>!\n" + render_day(fio, today, tzinfo))
             scheduler.add_job(morning_msg, trigger=trig_morning)
 
-        # Напоминания за 10 минут до уроков (только сегодня)
+        # Напоминания за 10 минут (только сегодня)
         if enabled and full_name:
             today_local = datetime.now(tzinfo).date()
             day_ru = DAY_MAP[datetime.now(tzinfo).strftime("%a")]
@@ -243,114 +215,43 @@ def schedule_daily_jobs():
     # Перестраиваем каждый день в 00:05 UTC
     scheduler.add_job(schedule_daily_jobs, trigger=CronTrigger(hour=0, minute=5, timezone="UTC"))
 
-# ---------- FSM для кода доступа ----------
-class Reg(StatesGroup):
-    wait_code = State()
-
+# ---------- Гварды ----------
 def guard_or_msg(u):
-    if not u or not u["verified"]:
-        return "🔒 Сначала введите код доступа: /start"
-    if not u["full_name"]:
-        return "Пришлите свои имя и фамилию (как в списке)."
+    if not u or not u["full_name"]:
+        return "👋 Привет! Напиши свои <b>имя и фамилию</b> (как в списке), чтобы я нашёл твоё расписание."
     return None
 
 def tz_for(u): return ZoneInfo(u["timezone"] or DEFAULT_TZ)
 
 # ---------- Хендлеры ----------
-@dp.message(Command("reset"))
-async def reset_cmd(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("Сбросил состояние. Нажми /start и введи код доступа снова.")
-
 @dp.message(Command("start"))
-async def start_cmd(m: Message, state: FSMContext):
-    # deep-link: /start <код>
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) == 2:
-        supplied = parts[1].strip()
-        if supplied == ACCESS_CODE:
-            # проходим верификацию, без ФИО пока
-            add_or_update_user(m.from_user.id, full_name=None, verified=True)
-            await state.clear()
-            return await m.answer(
-                "Код принят ✅ Теперь пришлите свои <b>имя и фамилию</b> (как в списке).",
-                reply_markup=main_kb()
-            )
-
+async def start_cmd(m: Message):
+    ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
-    if u and u["verified"]:
-        if u["full_name"]:
-            return await m.answer("Ты уже зарегистрирован ✅", reply_markup=main_kb())
-        else:
-            return await m.answer("Код уже принят ✅ Пришли свои имя и фамилию (как в списке).", reply_markup=main_kb())
-
-    await state.set_state(Reg.wait_code)
+    if u and u["full_name"]:
+        return await m.answer("Ты уже зарегистрирован ✅", reply_markup=main_kb())
     await m.answer(
-        "Привет! Этот бот только для своего класса.\n"
-        "🔒 Введи <b>код доступа</b> одним сообщением.\n"
-        f"Либо так: <code>/code {ACCESS_CODE}</code>",
+        "Привет! Этот бот показывает твоё личное расписание.\n"
+        "Напиши свои <b>имя и фамилию</b> ровно как в списке (пример: <i>Голованова Диана</i>).",
         reply_markup=main_kb()
     )
 
-@dp.message(Command("code"))
-async def code_cmd(m: Message, state: FSMContext):
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        return await m.answer("Напиши: /code <твой_код>")
-    supplied = parts[1].strip()
-    if supplied == ACCESS_CODE:
-        add_or_update_user(m.from_user.id, verified=True)
-        await state.clear()
-        return await m.answer(
-            "Код верный ✅ Теперь пришли свои <b>имя и фамилию</b> (как в списке).",
-            reply_markup=main_kb()
-        )
-    else:
-        return await m.answer("Код неверный ❌ Попробуй ещё раз или спроси учителя.")
+@dp.message(Command("logout"))
+async def logout_cmd(m: Message):
+    ensure_user(m.from_user.id)
+    set_full_name(m.from_user.id, None)
+    set_notify(m.from_user.id, False)
+    schedule_daily_jobs()
+    await m.answer(
+        "Ты вышел из профиля. Чтобы зайти снова — напиши свои <b>имя и фамилию</b> как в списке.",
+        reply_markup=main_kb()
+    )
 
-# Принимаем либо код, либо ФИО — НО не перехватываем кнопки/команды
-@dp.message(
-    F.text,
-    ~Command(commands={"start","code","reset","today","tomorrow","week","whoami","set_timezone","notify_on","notify_off"}),
-    ~F.text.in_(BUTTON_SET)
-)
-async def gate_and_register(m: Message, state: FSMContext):
-    u = get_user(m.from_user.id)
-
-    # Если нет в БД — создаём пустого
-    if not u:
-        add_or_update_user(m.from_user.id, verified=False)
-
-    # 1) Если не верифицирован — ожидаем код
-    u = get_user(m.from_user.id)
-    if not u["verified"]:
-        supplied = (m.text or "").strip()
-        if supplied == ACCESS_CODE:
-            set_verified(m.from_user.id, True)
-            return await m.answer("Код принят ✅ Теперь пришли свои <b>имя и фамилию</b> (как в списке).")
-        else:
-            return await m.answer("❌ Код неверный. Попробуй ещё раз или напиши /code <код>.")
-
-    # 2) Код принят, ждём ФИО
-    if not u["full_name"]:
-        name = (m.text or "").strip()
-        found = any(r for r in PERSONAL if r["ФИО"].lower()==name.lower())
-        if not found:
-            return await m.answer("Не нашёл такое ФИО 🙈 Проверь написание и пришли ещё раз.")
-        add_or_update_user(m.from_user.id, full_name=name)
-        schedule_daily_jobs()  # на всякий случай перестроим уведомления
-        return await m.answer(
-            f"Нашёл! 👋 Привет, <b>{name}</b>.\nКоманды: /today /tomorrow /week",
-            reply_markup=main_kb()
-        )
-    # 3) Иначе — пропускаем к другим хендлерам (кнопки/команды)
-
-# ---- Профиль и расписание ----
 @dp.message(Command("whoami"))
 async def whoami(m: Message):
     u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg: return await m.answer(msg)
+    if not u or not u["full_name"]:
+        return await m.answer("Ты пока не зарегистрирован. Пришли свои ФИО.")
     await m.answer(
         f"<b>Ты</b>: {u['full_name']}\n"
         f"Часовой пояс: {u['timezone']}\n"
@@ -389,8 +290,7 @@ async def week_cmd(m: Message):
 @dp.message(Command("set_timezone"))
 async def set_tz(m: Message):
     u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg: return await m.answer(msg)
+    ensure_user(m.from_user.id)
     parts = (m.text or "").split(maxsplit=1)
     if len(parts)==1:
         return await m.answer("Пример: /set_timezone Europe/Moscow")
@@ -421,21 +321,35 @@ async def notify_off(m: Message):
     schedule_daily_jobs()
     await m.answer("Уведомления выключены ⛔️")
 
-# ---- Кнопки (важно отдельно, чтобы не перехватывались регистрацией) ----
+# ---- Кнопки ----
 @dp.message(F.text.in_(BUTTON_SET))
 async def buttons_router(m: Message):
-    if m.text == BTN_TODAY:
-        return await today_cmd(m)
-    if m.text == BTN_TOMORROW:
-        return await tomorrow_cmd(m)
-    if m.text == BTN_WEEK:
-        return await week_cmd(m)
-    if m.text == BTN_PROFILE:
-        return await whoami(m)
-    if m.text == BTN_ON:
-        return await notify_on(m)
-    if m.text == BTN_OFF:
-        return await notify_off(m)
+    if m.text == BTN_TODAY:    return await today_cmd(m)
+    if m.text == BTN_TOMORROW: return await tomorrow_cmd(m)
+    if m.text == BTN_WEEK:     return await week_cmd(m)
+    if m.text == BTN_PROFILE:  return await whoami(m)
+    if m.text == BTN_ON:       return await notify_on(m)
+    if m.text == BTN_OFF:      return await notify_off(m)
+    if m.text == BTN_LOGOUT:   return await logout_cmd(m)
+
+# ---- Регистрация ФИО (текст) — НЕ перехватываем команды и кнопки ----
+@dp.message(
+    F.text,
+    ~Command(commands={"start","logout","today","tomorrow","week","whoami","set_timezone","notify_on","notify_off"}),
+    ~F.text.in_(BUTTON_SET)
+)
+async def register_name(m: Message):
+    ensure_user(m.from_user.id)
+    name = (m.text or "").strip()
+    found = any(r for r in PERSONAL if r["ФИО"].lower()==name.lower())
+    if not found:
+        return await m.answer("Не нашёл такое ФИО 🙈 Проверь написание и пришли ещё раз.")
+    set_full_name(m.from_user.id, name)
+    schedule_daily_jobs()
+    await m.answer(
+        f"Нашёл! 👋 Привет, <b>{name}</b>.\nКоманды: /today /tomorrow /week",
+        reply_markup=main_kb()
+    )
 
 # ---------- WEBHOOK (aiohttp) ----------
 async def on_startup():
@@ -450,7 +364,7 @@ async def on_startup():
 
     webhook_url = f"{BASE_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)  # secret обязателен
+    await bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
     logger.info(f"Webhook set to: {webhook_url}")
 
 async def on_shutdown(app: web.Application):
