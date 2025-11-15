@@ -210,15 +210,13 @@ def format_day(full_name: str, d: date) -> str:
     day_ru = WEEKDAY_RU[wd]
     header = f"<b>{day_ru}, {d.strftime('%d.%m.%Y')}</b>"
     if not lessons:
-        return header + "
-Нет уроков 🎉"
+        return header + "\nНет уроков 🎉"
     lines = [header]
     for r in lessons:
         lines.append(
             f"• {r['урок']}. {r['начало']}-{r['конец']} — <b>{r['предмет']}</b> ({r['класс-столбец']})"
         )
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 def format_week(full_name: str, base: date) -> str:
     monday = base - timedelta(days=base.weekday())
