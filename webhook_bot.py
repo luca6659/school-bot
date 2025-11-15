@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 # Telegram-бот (aiogram 3.x) для Render (Web Service)
-# ✔ Без пароля: /start просит ФИО (как в CSV) и регистрирует
-# ✔ Кнопки: Сегодня / Завтра / Неделя / Мой профиль / 🔔 Вкл / 🔕 Выкл / 🚪 Выйти / 🎮 Игры
-# ✔ Команды: /start /logout /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off /reload /games
-# ✔ Уведомления: утром 08:00 по личному TZ + напоминания за 10 минут до урока
-# ✔ «Умный» ввод ФИО: нормализация + подсказки по похожим именам
-# ✔ Мини-игры: орёл/решка, камень-ножницы-бумага, угадай число (1–20), мини-квиз
-# ✔ FIX: NOT NULL для full_name (первичная запись с "")
+# ✔ Без пароля: регистрация по ФИО из CSV
+# ✔ Кнопки: Сегодня / Завтра / Неделя / Мой профиль / 🔔 Вкл / 🔕 Выкл / 🎮 Игры / 🚪 Выйти
+# ✔ Команды: /start /logout /today /tomorrow /week /whoami /set_timezone /notify_on /notify_off /reload
+# ✔ Игры: орёл/решка, камень-ножницы-бумага, угадай число, мини-квиз
+# ✔ Уведомления: утром 08:00 + «Сюрприз дня» в 08:05 + напоминания за 10 минут
+# ✔ Надёжность уведомлений: misfire_grace_time, пересборка каждые 30 минут, построение «сегодня» на старте
+# ✔ Диагностика: /test_notify и /debug_notify
 
 import os
 import asyncio
@@ -25,7 +25,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -39,10 +39,11 @@ if not BOT_TOKEN:
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BASE_URL = os.getenv("BASE_URL")  # https://<твой-сервис>.onrender.com
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
 
-SCHEDULE_CSV      = "personal_schedule_all.csv"  # Файл с личными расписаниями
-DEFAULT_TZ        = "Europe/Moscow"              # МСК по умолчанию
-REMIND_BEFORE_MIN = 10
+SCHEDULE_CSV      = "personal_schedule_all.csv"
+DEFAULT_TZ        = "Europe/Moscow"
+REMIND_BEFORE_MIN = int(os.getenv("REMIND_BEFORE_MIN", "10"))  # можно менять через ENV
 
 # ---------- LOG ----------
 logging.basicConfig(level=logging.INFO)
@@ -63,18 +64,7 @@ BTN_OFF = "🔕 Выкл"
 BTN_LOGOUT = "🚪 Выйти"
 BTN_GAMES = "🎮 Игры"
 
-# Игровые кнопки
-BTN_RPS = "✊ Камень"
-BTN_RPS_PAPER = "✋ Бумага"
-BTN_RPS_SCISS = "✌️ Ножницы"
-BTN_COIN = "🪙 Орёл/решка"
-BTN_GUESS_START = "🔢 Угадай число"
-BTN_QUIZ = "🧠 Квиз"
-
-BUTTON_SET = {
-    BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_PROFILE, BTN_ON, BTN_OFF, BTN_LOGOUT, BTN_GAMES,
-    BTN_RPS, BTN_RPS_PAPER, BTN_RPS_SCISS, BTN_COIN, BTN_GUESS_START, BTN_QUIZ
-}
+BUTTON_SET = {BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_PROFILE, BTN_ON, BTN_OFF, BTN_LOGOUT, BTN_GAMES}
 
 def main_kb():
     return ReplyKeyboardMarkup(
@@ -83,25 +73,6 @@ def main_kb():
             [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_PROFILE)],
             [KeyboardButton(text=BTN_ON), KeyboardButton(text=BTN_OFF)],
             [KeyboardButton(text=BTN_GAMES), KeyboardButton(text=BTN_LOGOUT)],
-        ],
-        resize_keyboard=True,
-    )
-
-def games_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_COIN), KeyboardButton(text=BTN_GUESS_START)],
-            [KeyboardButton(text=BTN_RPS), KeyboardButton(text=BTN_QUIZ)],
-            [KeyboardButton(text="⬅️ Назад")],
-        ],
-        resize_keyboard=True,
-    )
-
-def rps_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_RPS), KeyboardButton(text=BTN_RPS_PAPER), KeyboardButton(text=BTN_RPS_SCISS)],
-            [KeyboardButton(text="⬅️ Назад")],
         ],
         resize_keyboard=True,
     )
@@ -162,6 +133,15 @@ def init_db():
           quiz_score INTEGER NOT NULL DEFAULT 0
         );
         """)
+        conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS poll_votes(
+          tg_id INTEGER NOT NULL,
+          iso_year INTEGER NOT NULL,
+          iso_week INTEGER NOT NULL,
+          choice TEXT NOT NULL,
+          PRIMARY KEY (tg_id, iso_year, iso_week)
+        );
+        """)
 
 def get_user(tg_id: int):
     with closing(db()) as conn, conn:
@@ -174,7 +154,6 @@ def get_user(tg_id: int):
                 "notify_enabled":bool(row[3])}
 
 def ensure_user(tg_id:int):
-    """FIX: если таблица старая с NOT NULL для full_name — вставляем пустую строку."""
     if not get_user(tg_id):
         with closing(db()) as conn, conn:
             conn.execute(
@@ -194,24 +173,10 @@ def set_timezone(tg_id:int, tz:str):
     with closing(db()) as conn, conn:
         conn.execute("UPDATE users SET timezone=? WHERE tg_id=?", (tz, tg_id))
 
-def get_or_create_stats(tg_id:int):
-    with closing(db()) as conn, conn:
-        row = conn.execute("SELECT tg_id, rps_wins, rps_losses, rps_draws, quiz_score FROM game_stats WHERE tg_id=?",(tg_id,)).fetchone()
-        if row: return {"tg_id":row[0], "wins":row[1], "losses":row[2], "draws":row[3], "quiz":row[4]}
-        conn.execute("INSERT INTO game_stats(tg_id) VALUES(?)",(tg_id,))
-        return {"tg_id":tg_id, "wins":0,"losses":0,"draws":0,"quiz":0}
+# ---------- Helpers ----------
+def is_admin(tg_id:int)->bool:
+    return tg_id in ADMIN_IDS
 
-def save_rps_stats(tg_id:int, result:str):
-    with closing(db()) as conn, conn:
-        if result=="win":   conn.execute("UPDATE game_stats SET rps_wins=rps_wins+1 WHERE tg_id=?", (tg_id,))
-        elif result=="loss":conn.execute("UPDATE game_stats SET rps_losses=rps_losses+1 WHERE tg_id=?", (tg_id,))
-        else:               conn.execute("UPDATE game_stats SET rps_draws=rps_draws+1 WHERE tg_id=?", (tg_id,))
-
-def add_quiz_score(tg_id:int, delta:int):
-    with closing(db()) as conn, conn:
-        conn.execute("UPDATE game_stats SET quiz_score=quiz_score+? WHERE tg_id=?", (delta, tg_id))
-
-# ---------- Рендер сообщений ----------
 def fmt_lesson(r:dict)->str:
     return f"<b>{r['начало']}-{r['конец']}</b> • {r['предмет']} ({r['класс-столбец']})"
 
@@ -244,80 +209,208 @@ async def send(tg_id:int, text:str):
     except Exception as e:
         logger.warning(f"send fail to {tg_id}: {e}")
 
-# ---------- Планировщик (утро + за 10 минут) ----------
-def schedule_daily_jobs():
-    scheduler.remove_all_jobs()
-    with closing(db()) as conn, conn:
-        users = conn.execute("SELECT tg_id, full_name, timezone, notify_enabled FROM users").fetchall()
+# ---------- Сюрприз дня ----------
+SURPRISES = [
+    "✨ Факт: У улиток 14 000 зубов, но они всё равно едят медленно.",
+    "🧩 Задача: Сколько будет 15% от 240? (Подумай и проверь 😉)",
+    "💭 Цитата: «Не ошибается тот, кто ничего не делает» — Т. Рузвельт.",
+    "🧠 Лайфхак: 25–5–5 — 25 мин учёбы, 5 отдых, 5 повторение.",
+    "📚 Мини-квиз: Сколько граней у додекаэдра? (12)",
+    "🎯 Совет: Делите сложное на маленькие шаги.",
+    "🔬 Факт: Бананы слегка радиоактивны из-за калия-40.",
+    "🗺 Факт: В России 11 часовых поясов!",
+]
+def surprise_text(for_date: date)->str:
+    idx = (for_date.toordinal() + 17) % len(SURPRISES)
+    return "🎁 <b>Сюрприз дня</b>\n" + SURPRISES[idx]
 
-    # ежедневная перестройка (на случай смены TZ/имени)
-    scheduler.add_job(schedule_daily_jobs, trigger=CronTrigger(hour=0, minute=5, timezone="UTC"))
+# ---------- Планировщик: надёжная схема ----------
+def job_id(prefix:str, tg_id:int, extra:str=""):
+    return f"{prefix}_{tg_id}_{extra}"
 
-    for tg_id, full_name, tz, enabled in users:
-        # пустое имя ("") = не зарегистрирован
-        if not full_name or not full_name.strip():
+def schedule_user_daily(u):
+    """Планирует ежедневные утренние задачи (08:00 расписание, 08:05 сюрприз)."""
+    tg_id = u["tg_id"]
+    full_name = u["full_name"]
+    tzinfo = ZoneInfo(u["timezone"] or DEFAULT_TZ)
+
+    if not full_name.strip():
+        return
+
+    # Утреннее сообщение
+    scheduler.add_job(
+        func=lambda chat_id=tg_id, fio=full_name, tzinfo=tzinfo: asyncio.create_task(
+            send(chat_id, f"🌞 Доброе утро, <b>{fio}</b>!\n" +
+                 render_day(fio, datetime.now(tzinfo).date(), tzinfo))
+        ),
+        trigger=CronTrigger(hour=8, minute=0, timezone=tzinfo),
+        id=job_id("morning", tg_id),
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+    # Сюрприз
+    scheduler.add_job(
+        func=lambda chat_id=tg_id, tzinfo=tzinfo: asyncio.create_task(
+            send(chat_id, surprise_text(datetime.now(tzinfo).date()))
+        ),
+        trigger=CronTrigger(hour=8, minute=5, timezone=tzinfo),
+        id=job_id("surprise", tg_id),
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+    logger.info(f"[schedule_user_daily] set for {tg_id} ({full_name}) tz={tzinfo}")
+
+def schedule_user_today_reminders(u):
+    """Планирует напоминания 'сегодня' за REMIND_BEFORE_MIN мин, без дублей."""
+    tg_id = u["tg_id"]
+    full_name = u["full_name"]
+    tzinfo = ZoneInfo(u["timezone"] or DEFAULT_TZ)
+    if not full_name.strip():
+        return
+
+    today = datetime.now(tzinfo).date()
+    day_ru = DAY_MAP[datetime.now(tzinfo).strftime("%a")]
+    rows = personal_for(full_name, day_ru)
+    now_local = datetime.now(tzinfo)
+
+    for r in rows:
+        hh, mm = map(int, r["начало"].split(":"))
+        start_dt = datetime.combine(today, time(hh, mm), tzinfo)
+        remind_at = start_dt - timedelta(minutes=REMIND_BEFORE_MIN)
+        if remind_at <= now_local:
             continue
+        jid = job_id("remind", tg_id, f"{r['предмет']}_{r['начало']}")
+        # Планируем (перезапишет если было)
+        scheduler.add_job(
+            func=lambda chat_id=tg_id, subj=r['предмет'], st=r['начало'], col=r['класс-столбец']:
+                asyncio.create_task(send(chat_id, f"🔔 Скоро урок: <b>{subj}</b> в {st} — {col}")),
+            trigger=DateTrigger(run_date=remind_at),
+            id=jid,
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
+        logger.info(f"[schedule_user_today_reminders] + {jid} at {remind_at.isoformat()}")
 
-        tzinfo = ZoneInfo(tz or DEFAULT_TZ)
+def schedule_all_users():
+    """Полная пересборка задач: утро + сегодняшние напоминания для всех с notify_enabled=1."""
+    with closing(db()) as conn, conn:
+        users = conn.execute(
+            "SELECT tg_id, full_name, timezone, notify_enabled FROM users WHERE notify_enabled=1"
+        ).fetchall()
 
-        # Утренняя рассылка 08:00 локального времени — ежедневный cron
-        if enabled:
-            scheduler.add_job(
-                func=lambda chat_id=tg_id, fio=full_name, tzinfo=tzinfo: asyncio.create_task(
-                    send(chat_id, f"🌞 Доброе утро, <b>{fio}</b>!\n" + render_day(fio, datetime.now(tzinfo).date(), tzinfo))
-                ),
-                trigger=CronTrigger(hour=8, minute=0, timezone=tzinfo),
-                name=f"morning_{tg_id}"
-            )
+    # утренний пересборщик
+    scheduler.add_job(schedule_all_users,
+                      trigger=CronTrigger(hour=0, minute=5, timezone="UTC"),
+                      id="rebuild_daily_utc",
+                      replace_existing=True,
+                      misfire_grace_time=3600)
 
-            # Напоминания «сегодня» — одноразовые даты
-            today_local = datetime.now(tzinfo).date()
-            day_ru = DAY_MAP[datetime.now(tzinfo).strftime("%a")]
-            rows = personal_for(full_name, day_ru)
-            now_local = datetime.now(tzinfo)
-            for r in rows:
-                hh, mm = map(int, r["начало"].split(":"))
-                start_dt = datetime.combine(today_local, time(hh, mm), tzinfo)
-                remind_at = start_dt - timedelta(minutes=REMIND_BEFORE_MIN)
-                if remind_at > now_local:
-                    scheduler.add_job(
-                        func=lambda chat_id=tg_id, subj=r['предмет'], st=r['начало'], col=r['класс-столбец']:
-                            asyncio.create_task(send(chat_id, f"🔔 Скоро урок: <b>{subj}</b> в {st} — {col}")),
-                        trigger=DateTrigger(run_date=remind_at),
-                        name=f"remind_{tg_id}_{r['предмет']}_{r['начало']}"
-                    )
+    # подстраховка каждые 30 минут — перестроить «сегодня» (не дублирует)
+    scheduler.add_job(schedule_all_today_reminders,
+                      trigger=CronTrigger(minute="*/30", timezone="UTC"),
+                      id="rebuild_today_halfhour",
+                      replace_existing=True,
+                      misfire_grace_time=3600)
+
+    count = 0
+    for tg_id, full_name, tz, enabled in users:
+        u = {"tg_id": tg_id, "full_name": full_name, "timezone": tz, "notify_enabled": bool(enabled)}
+        if not u["full_name"].strip():
+            continue
+        schedule_user_daily(u)
+        count += 1
+    logger.info(f"[schedule_all_users] daily scheduled for {count} users")
+
+def schedule_all_today_reminders():
+    """Перестроить напоминания 'сегодня' для всех (без дублей, replace_existing=True)."""
+    with closing(db()) as conn, conn:
+        users = conn.execute(
+            "SELECT tg_id, full_name, timezone, notify_enabled FROM users WHERE notify_enabled=1"
+        ).fetchall()
+    cnt = 0
+    for tg_id, full_name, tz, enabled in users:
+        u = {"tg_id": tg_id, "full_name": full_name, "timezone": tz, "notify_enabled": bool(enabled)}
+        if not u["full_name"].strip():
+            continue
+        schedule_user_today_reminders(u)
+        cnt += 1
+    logger.info(f"[schedule_all_today_reminders] reminders refreshed for {cnt} users")
+
+# ---------- Опрос недели ----------
+POLL_CHOICES = ["🔥 Отлично", "🙂 Нормально", "😅 Сложно"]
+def current_iso() -> tuple[int,int]:
+    y, w, _ = datetime.now().isocalendar()
+    return int(y), int(w)
+
+def poll_vote(tg_id:int, choice:str):
+    y, w = current_iso()
+    with closing(db()) as conn, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO poll_votes(tg_id, iso_year, iso_week, choice) VALUES(?,?,?,?)",
+            (tg_id, y, w, choice)
+        )
+
+def poll_results(iso_y:int=None, iso_w:int=None):
+    if iso_y is None or iso_w is None:
+        iso_y, iso_w = current_iso()
+    with closing(db()) as conn, conn:
+        rows = conn.execute("SELECT choice, COUNT(*) FROM poll_votes WHERE iso_year=? AND iso_week=? GROUP BY choice",
+                            (iso_y, iso_w)).fetchall()
+    counts = {c:0 for c in POLL_CHOICES}
+    for c, cnt in rows:
+        if c in counts:
+            counts[c] = cnt
+    total = sum(counts.values())
+    return iso_y, iso_w, counts, total
 
 # ---------- Гварды ----------
-def guard_or_msg(u):
-    # пустая строка имени считается незарегистрированным состоянием
+def guard_fullname(u):
     if not u or not u["full_name"] or not u["full_name"].strip():
-        return ("👋 Привет! Напиши свои <b>имя и фамилию</b> (как в списке), "
-                "чтобы я показал твоё личное расписание.")
+        return ("✍️ Пришли свои <b>имя и фамилию</b> как в списке (пример: <i>Абдуллаев Абдула</i>).")
     return None
 
 def tz_for(u): return ZoneInfo(u["timezone"] or DEFAULT_TZ)
 
-# ---------- Состояния игр (в памяти) ----------
-GUESS = {}  # tg_id -> {"n":int, "tries":int}
-QUIZ = {}   # tg_id -> {"a":int,"b":int,"op":"+|*|−","ans":int}
-
-def new_guess(tg_id:int):
-    GUESS[tg_id] = {"n": random.randint(1, 20), "tries": 0}
-
-def new_quiz(tg_id:int):
-    a,b = random.randint(2,9), random.randint(2,9)
-    op = random.choice(["+", "*", "-"])
-    if op == "+": ans = a+b
-    elif op == "*": ans = a*b
-    else: ans = a-b
-    QUIZ[tg_id] = {"a":a,"b":b,"op":op,"ans":ans}
-
-# ---------- Команды ----------
+# ---------- Команды сервиса/диагностики ----------
 @dp.message(Command("reload"))
 async def reload_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Команда только для админов.")
     load_personal_csv()
-    await m.answer("CSV перечитан ✅")
+    schedule_all_today_reminders()
+    await m.answer("CSV перечитан ✅ Напоминания на сегодня перестроены.")
 
+@dp.message(Command("test_notify"))
+async def test_notify(m: Message):
+    """Тест: через 1 минуту придёт сообщение (проверка планировщика)."""
+    u = get_user(m.from_user.id) or {}
+    tzinfo = ZoneInfo((u.get("timezone") or DEFAULT_TZ))
+    run_at = datetime.now(tzinfo) + timedelta(minutes=1)
+    jid = job_id("test", m.from_user.id, str(int(run_at.timestamp())))
+    scheduler.add_job(lambda: asyncio.create_task(send(m.from_user.id, "✅ Тест уведомлений: работает.")),
+                      trigger=DateTrigger(run_date=run_at),
+                      id=jid, replace_existing=True, misfire_grace_time=3600)
+    await m.answer(f"Ок! Тест-уведомление запланировано на {run_at.strftime('%H:%M:%S')} ({u.get('timezone', DEFAULT_TZ)}).")
+
+@dp.message(Command("debug_notify"))
+async def debug_notify(m: Message):
+    """Покажет все задания APScheduler, относящиеся к текущему пользователю."""
+    uid = m.from_user.id
+    jobs = [j for j in scheduler.get_jobs() if f"_{uid}" in j.id]
+    if not jobs:
+        return await m.answer("Для тебя сейчас нет активных задач.")
+    lines = ["🔧 Твои задачи:"]
+    for j in jobs:
+        lines.append(f"• {j.id} → {j.next_run_time.isoformat() if j.next_run_time else '—'}")
+    await m.answer("\n".join(lines))
+
+# ---------- Базовые команды ----------
 @dp.message(Command("start"))
 async def start_cmd(m: Message):
     ensure_user(m.from_user.id)
@@ -325,7 +418,7 @@ async def start_cmd(m: Message):
     if u and u["full_name"] and u["full_name"].strip():
         return await m.answer(
             f"Ты уже в системе как <b>{u['full_name']}</b> ✅\n"
-            "Команды: /today /tomorrow /week /whoami /notify_on /notify_off /logout /games",
+            "Команды: /today /tomorrow /week /whoami /notify_on /notify_off /surprise /poll /games /logout",
             reply_markup=main_kb()
         )
     hint = "Напиши свои <b>имя и фамилию</b> ровно как в списке (пример: <i>Абдуллаев Абдула</i>)."
@@ -337,25 +430,19 @@ async def start_cmd(m: Message):
 @dp.message(Command("logout"))
 async def logout_cmd(m: Message):
     ensure_user(m.from_user.id)
-    set_full_name(m.from_user.id, None)   # запишется "" по нашему сеттеру
+    set_full_name(m.from_user.id, None)
     set_notify(m.from_user.id, False)
-    schedule_daily_jobs()
-    await m.answer(
-        "Ты вышел из профиля. Чтобы зайти снова — напиши свои <b>имя и фамилию</b> как в списке.",
-        reply_markup=main_kb()
-    )
+    await m.answer("Ты вышел из профиля. Чтобы зайти снова — пришли своё ФИО.", reply_markup=main_kb())
 
 @dp.message(Command("whoami"))
 async def whoami(m: Message):
     u = get_user(m.from_user.id)
-    if not u or not u["full_name"] or not u["full_name"].strip():
-        return await m.answer("Ты пока не зарегистрирован. Пришли свои ФИО.")
-    st = strata_of_student(u['full_name'])
+    if msg := guard_fullname(u): return await m.answer(msg)
     await m.answer(
         f"<b>Ты</b>: {u['full_name']}\n"
         f"Часовой пояс: {u['timezone']}\n"
         f"Уведомления: {'вкл' if u['notify_enabled'] else 'выкл'}\n"
-        f"Твои колонки/страты: {st}"
+        f"Твои колонки/страты: {strata_of_student(u['full_name'])}"
     )
 
 def day_for_user(u, delta_days=0):
@@ -365,24 +452,21 @@ def day_for_user(u, delta_days=0):
 @dp.message(Command("today"))
 async def today_cmd(m: Message):
     u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg: return await m.answer(msg)
+    if msg := guard_fullname(u): return await m.answer(msg)
     d, tz = day_for_user(u, 0)
     await m.answer(render_day(u["full_name"], d, tz))
 
 @dp.message(Command("tomorrow"))
 async def tomorrow_cmd(m: Message):
     u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg: return await m.answer(msg)
+    if msg := guard_fullname(u): return await m.answer(msg)
     d, tz = day_for_user(u, 1)
     await m.answer(render_day(u["full_name"], d, tz))
 
 @dp.message(Command("week"))
 async def week_cmd(m: Message):
     u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg: return await m.answer(msg)
+    if msg := guard_fullname(u): return await m.answer(msg)
     d, tz = day_for_user(u, 0)
     await m.answer(render_week(u["full_name"], d, tz))
 
@@ -398,45 +482,180 @@ async def set_tz(m: Message):
     except Exception:
         return await m.answer("Не знаю такой таймзоны 😢")
     set_timezone(m.from_user.id, tz)
-    schedule_daily_jobs()
+    # перестроим задачи
+    u = get_user(m.from_user.id)
+    schedule_user_daily(u)
+    schedule_user_today_reminders(u)
     await m.answer(f"Часовой пояс установлен: <b>{tz}</b>")
 
 @dp.message(Command("notify_on"))
 async def notify_on(m: Message):
     u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg: return await m.answer(msg)
+    if msg := guard_fullname(u): return await m.answer(msg)
     set_notify(m.from_user.id, True)
-    schedule_daily_jobs()
-    await m.answer("Уведомления включены ✅")
+    # сразу перестроим задачи этому пользователю
+    u = get_user(m.from_user.id)
+    schedule_user_daily(u)
+    schedule_user_today_reminders(u)
+    await m.answer("Уведомления включены ✅ (утро + напоминания за 10 мин).")
 
 @dp.message(Command("notify_off"))
 async def notify_off(m: Message):
     u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg: return await m.answer(msg)
+    if msg := guard_fullname(u): return await m.answer(msg)
     set_notify(m.from_user.id, False)
-    schedule_daily_jobs()
+    # удалим его задачи
+    for j in list(scheduler.get_jobs()):
+        if f"_{m.from_user.id}_" in j.id or j.id.endswith(f"_{m.from_user.id}"):
+            scheduler.remove_job(j.id)
     await m.answer("Уведомления выключены ⛔️")
 
 # ---------- Игры ----------
+from random import choice as rnd_choice
+
 @dp.message(Command("games"))
 async def games_cmd(m: Message):
-    stats = get_or_create_stats(m.from_user.id)
-    txt = ( "🎮 <b>Мини-игры</b>\n"
-            "• 🪙 Орёл/решка — случайный бросок\n"
-            "• ✊✋✌️ Камень-ножницы-бумага\n"
-            "• 🔢 Угадай число 1–20\n"
-            "• 🧠 Мини-квиз (арифметика)\n\n"
-            f"RPS: {stats['wins']} побед • {stats['losses']} поражений • {stats['draws']} ничьих\n"
-            f"Квиз: {stats['quiz']} очков" )
-    await m.answer(txt, reply_markup=games_kb())
+    await m.answer(
+        "🎮 Игры:\n• 🪙 орёл/решка — напиши «монета»\n• камень/ножницы/бумага — «камень», «ножницы» или «бумага»\n"
+        "• угадай число — «угадай», затем числа 1–20\n• мини-квиз — «квиз»",
+        reply_markup=main_kb()
+    )
 
-# Кнопки основного меню и игрового меню
-@dp.message(F.text.in_({"⬅️ Назад"}))
-async def back_btn(m: Message):
-    await m.answer("Ок, вернулись в меню.", reply_markup=main_kb())
+GUESS = {}  # tg_id -> {"n":int, "tries":int}
+QUIZ  = {}  # tg_id -> {"a":int,"b":int,"op":"+|*|−","ans":int}
 
+def new_guess(tg_id:int):
+    GUESS[tg_id] = {"n": random.randint(1, 20), "tries": 0}
+
+def new_quiz(tg_id:int):
+    a,b = random.randint(2,9), random.randint(2,9)
+    op = random.choice(["+", "*", "-"])
+    ans = a+b if op=="+" else (a*b if op=="*" else a-b)
+    QUIZ[tg_id] = {"a":a,"b":b,"op":op,"ans":ans}
+
+@dp.message(F.text.func(lambda s: s and s.lower()=="монета"))
+async def coin(m: Message):
+    await m.answer(f"🪙 Выпало: <b>{rnd_choice(['Орёл','Решка'])}</b>")
+
+@dp.message(F.text.func(lambda s: s and s.lower()=="угадай"))
+async def guess_start(m: Message):
+    new_guess(m.from_user.id)
+    await m.answer("Я загадал число 1–20. Пиши число! (стоп — «стоп»).")
+
+@dp.message(F.text.regexp(r"^\d+$"))
+async def guess_digit(m: Message):
+    tg_id = m.from_user.id
+    if tg_id not in GUESS:
+        return
+    n = int(m.text)
+    if not (1 <= n <= 20):
+        return await m.answer("Число от 1 до 20 😉")
+    GUESS[tg_id]["tries"] += 1
+    target = GUESS[tg_id]["n"]
+    if n == target:
+        tries = GUESS[tg_id]["tries"]
+        del GUESS[tg_id]
+        return await m.answer(f"🎉 Верно! Это <b>{target}</b>. Попыток: {tries}.")
+    elif n < target:
+        return await m.answer("Моё число больше ↑")
+    else:
+        return await m.answer("Моё число меньше ↓")
+
+@dp.message(F.text.func(lambda s: s and s.lower() in {"стоп","stop","выйти"}))
+async def guess_stop(m: Message):
+    if m.from_user.id in GUESS:
+        del GUESS[m.from_user.id]
+        await m.answer("Ок, игру остановили.")
+
+@dp.message(F.text.func(lambda s: s and s.lower() in {"квиз"}))
+async def quiz_start(m: Message):
+    new_quiz(m.from_user.id)
+    q = QUIZ[m.from_user.id]
+    await m.answer(f"Сколько будет: <b>{q['a']} {q['op']} {q['b']}</b> ? Ответ — числом.")
+
+@dp.message(F.text.regexp(r"^-?\d+$"))
+async def quiz_answer(m: Message):
+    tg_id = m.from_user.id
+    if tg_id not in QUIZ:
+        return
+    ans = int(m.text)
+    q = QUIZ[tg_id]
+    if ans == q["ans"]:
+        new_quiz(tg_id)
+        q2 = QUIZ[tg_id]
+        return await m.answer(f"✅ Правильно!\nСледующий: <b>{q2['a']} {q2['op']} {q2['b']}</b> = ?")
+    else:
+        return await m.answer(f"❌ Неверно. Правильно: <b>{q['ans']}</b>. Напиши «квиз», чтобы начать заново.")
+
+# ---------- Сюрприз дня ----------
+@dp.message(Command("surprise")))
+async def surprise_cmd(m: Message):
+    u = get_user(m.from_user.id)
+    tzinfo = ZoneInfo((u["timezone"] if u else DEFAULT_TZ))
+    await m.answer(surprise_text(datetime.now(tzinfo).date()))
+
+# ---------- Опрос недели ----------
+@dp.message(Command("poll"))
+async def poll_cmd(m: Message):
+    y,w = current_iso()
+    choices = "\n".join(f"{i+1}. {c}" for i,c in enumerate(POLL_CHOICES))
+    await m.answer(
+        f"🗳 <b>Опрос недели {w}/{y}</b>\nКак прошла неделя?\n{choices}\n\n"
+        "Отправь номер ответа (1–3)."
+    )
+
+@dp.message(F.text.regexp(r"^[1-3]$"))
+async def poll_vote_msg(m: Message):
+    idx = int(m.text) - 1
+    choice = POLL_CHOICES[idx]
+    poll_vote(m.from_user.id, choice)
+    await m.answer(f"Спасибо! Твой ответ: <b>{choice}</b>.")
+
+@dp.message(Command("poll_stats"))
+async def poll_stats_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Команда только для админов.")
+    y, w, counts, total = poll_results()
+    if total == 0:
+        return await m.answer(f"🗳 Опрос {w}/{y}: пока нет голосов.")
+    lines = [f"🗳 Опрос {w}/{y}: всего {total}"]
+    for c in POLL_CHOICES:
+        lines.append(f"{c}: {counts[c]}")
+    await m.answer("\n".join(lines))
+
+# ---------- Админ-панель ----------
+@dp.message(Command("admin"))
+async def admin_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Команда только для админов.")
+    await m.answer(
+        "🛠 <b>Админ-панель</b>\n"
+        "• /broadcast <текст> — рассылка всем\n"
+        "• /poll_stats — статистика опроса недели\n"
+        "• /reload — перечитать CSV\n"
+        "• /debug_notify — посмотреть свои задачи (для проверки)"
+    )
+
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Команда только для админов.")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts)==1:
+        return await m.answer("Использование: /broadcast <текст>")
+    text = parts[1].strip()
+    with closing(db()) as conn, conn:
+        rows = conn.execute("SELECT tg_id FROM users").fetchall()
+    sent, fail = 0, 0
+    for (tg_id,) in rows:
+        try:
+            await bot.send_message(tg_id, f"📢 <b>Объявление</b>\n{text}")
+            sent += 1
+        except Exception:
+            fail += 1
+    await m.answer(f"Готово. Отправлено: {sent}, ошибок: {fail}.")
+
+# ---- Кнопки основного меню ----
 @dp.message(F.text.in_(BUTTON_SET))
 async def buttons_router(m: Message):
     t = m.text
@@ -449,101 +668,12 @@ async def buttons_router(m: Message):
     if t == BTN_LOGOUT:   return await logout_cmd(m)
     if t == BTN_GAMES:    return await games_cmd(m)
 
-    # Игровые кнопки
-    if t == BTN_COIN:
-        res = random.choice(["Орёл", "Решка"])
-        return await m.answer(f"🪙 Выпало: <b>{res}</b>")
-
-    if t == BTN_RPS:
-        await m.answer("Выбери жест:", reply_markup=rps_kb())
-        return
-
-    if t in {BTN_RPS, BTN_RPS_PAPER, BTN_RPS_SCISS}:
-        # уже обработали BTN_RPS выше; остальные два — тоже здесь
-        pass
-
-    if t == BTN_RPS_PAPER or t == BTN_RPS_SCISS:
-        # просто оставим, обработаем в общем RPS-хендлере ниже
-        pass
-
-    if t == BTN_GUESS_START:
-        new_guess(m.from_user.id)
-        return await m.answer("Я загадал число от 1 до 20. Отправляй число сообщением! (Для выхода — напиши «стоп»)",
-                              reply_markup=games_kb())
-
-    if t == BTN_QUIZ:
-        new_quiz(m.from_user.id)
-        q = QUIZ[m.from_user.id]
-        return await m.answer(f"Сколько будет: <b>{q['a']} {q['op']} {q['b']}</b> ? Отправь ответ числом.",
-                              reply_markup=games_kb())
-
-# RPS жесты
-@dp.message(F.text.in_({BTN_RPS, BTN_RPS_PAPER, BTN_RPS_SCISS}))
-async def rps_play(m: Message):
-    user_map = {BTN_RPS:"камень", BTN_RPS_PAPER:"бумага", BTN_RPS_SCISS:"ножницы"}
-    you = user_map[m.text]
-    bot_move = random.choice(["камень","бумага","ножницы"])
-    if you == bot_move:
-        result = "draw"
-        text = f"Ты: {you}\nЯ: {bot_move}\nНичья 😐"
-    elif (you=="камень" and bot_move=="ножницы") or (you=="ножницы" and bot_move=="бумага") or (you=="бумага" and bot_move=="камень"):
-        result = "win"
-        text = f"Ты: {you}\nЯ: {bot_move}\nТы победил! 🎉"
-    else:
-        result = "loss"
-        text = f"Ты: {you}\nЯ: {bot_move}\nЯ победил 😎"
-    save_rps_stats(m.from_user.id, result)
-    await m.answer(text, reply_markup=rps_kb())
-
-# GUESS: число 1–20
-@dp.message(F.text.regexp(r"^\d+$"))
-async def guess_digit(m: Message):
-    tg_id = m.from_user.id
-    if tg_id not in GUESS:
-        return  # не в игре — пропускаем дальше (до регистрации ФИО или др. хендлеров)
-    n = int(m.text)
-    if not (1 <= n <= 20):
-        return await m.answer("Число должно быть от 1 до 20.")
-    GUESS[tg_id]["tries"] += 1
-    target = GUESS[tg_id]["n"]
-    if n == target:
-        tries = GUESS[tg_id]["tries"]
-        del GUESS[tg_id]
-        return await m.answer(f"🎉 Верно! Это <b>{target}</b>. Попыток: {tries}.", reply_markup=games_kb())
-    elif n < target:
-        return await m.answer("Моё число больше ↑", reply_markup=games_kb())
-    else:
-        return await m.answer("Моё число меньше ↓", reply_markup=games_kb())
-
-@dp.message(F.text.func(lambda s: s and s.lower().strip() in {"стоп","stop","выйти"}))
-async def guess_stop(m: Message):
-    if m.from_user.id in GUESS:
-        del GUESS[m.from_user.id]
-        await m.answer("Ок, игру остановили. Хочешь ещё? Нажми «🔢 Угадай число».", reply_markup=games_kb())
-
-# QUIZ: арифметика
-@dp.message(F.text.regexp(r"^-?\d+$"))
-async def quiz_answer(m: Message):
-    tg_id = m.from_user.id
-    if tg_id not in QUIZ:
-        return  # не в квизе
-    ans = int(m.text)
-    q = QUIZ[tg_id]
-    if ans == q["ans"]:
-        add_quiz_score(tg_id, 1)
-        new_quiz(tg_id)
-        q2 = QUIZ[tg_id]
-        return await m.answer(f"✅ Правильно!\nСледующий: <b>{q2['a']} {q2['op']} {q2['b']}</b> = ?",
-                              reply_markup=games_kb())
-    else:
-        add_quiz_score(tg_id, 0)  # можно не менять
-        return await m.answer(f"❌ Неверно. Правильно: <b>{q['ans']}</b>. Нажми «🧠 Квиз», чтобы начать заново.",
-                              reply_markup=games_kb())
-
-# ---- Регистрация ФИО (умная) — ставим НИЖЕ игровых числовых хендлеров, чтобы они не перехватывались ----
+# ---- Регистрация ФИО (умная) ----
 @dp.message(
     F.text,
-    ~Command(commands={"start","logout","today","tomorrow","week","whoami","set_timezone","notify_on","notify_off","reload","games"}),
+    ~Command(commands={"start","logout","today","tomorrow","week","whoami","set_timezone",
+                       "notify_on","notify_off","reload","games","surprise","poll","poll_stats",
+                       "admin","broadcast","test_notify","debug_notify"}),
     ~F.text.in_(BUTTON_SET)
 )
 async def register_name(m: Message):
@@ -551,35 +681,35 @@ async def register_name(m: Message):
     raw = (m.text or "").strip()
     if not raw:
         return await m.answer("Пришли, пожалуйста, свои имя и фамилию.")
-
     want = normalize_name(raw)
-    # точное совпадение
     exact = next((n for n in ALL_NAMES if normalize_name(n) == want), None)
     if exact:
         set_full_name(m.from_user.id, exact)
-        schedule_daily_jobs()
+        # построим уведомления для этого пользователя сразу
+        u = get_user(m.from_user.id)
+        schedule_user_daily(u)
+        schedule_user_today_reminders(u)
         return await m.answer(
-            f"Нашёл! 👋 Привет, <b>{exact}</b>.\nКоманды: /today /tomorrow /week /games",
+            f"Нашёл! 👋 Привет, <b>{exact}</b>.\nКоманды: /today /tomorrow /week /games /poll /surprise\n"
+            "Совет: набери /test_notify — проверим доставку за 1 минуту.",
             reply_markup=main_kb()
         )
-
-    # подсказки
     tips = difflib.get_close_matches(raw, ALL_NAMES, n=5, cutoff=0.5)
     if tips:
         lines = "\n".join(f"• {t}" for t in tips)
-        return await m.answer(
-            "Не нашёл такое ФИО 🙈\nВозможно, ты имел в виду:\n" + lines + "\n\n"
-            "Скопируй подходящее и пришли ещё раз."
-        )
-
+        return await m.answer("Не нашёл такое ФИО 🙈\nВозможно, ты имел в виду:\n" + lines + "\n\nСкопируй и пришли ещё раз.")
     await m.answer("Не нашёл такое ФИО 🙈 Проверь написание и пришли ещё раз (как в списке).")
 
 # ---------- WEBHOOK (aiohttp) ----------
 async def on_startup():
     init_db()
     load_personal_csv()
-    schedule_daily_jobs()
+    # 1) старт планировщика
     scheduler.start()
+    # 2) общая пересборка ежедневных задач + подстраховка
+    schedule_all_users()
+    # 3) построить напоминания «сегодня» сразу после запуска
+    schedule_all_today_reminders()
 
     if not BASE_URL:
         logger.warning("BASE_URL не задан. Задай env BASE_URL=адрес сервиса и сделай redeploy.")
