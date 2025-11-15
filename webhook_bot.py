@@ -209,8 +209,10 @@ def format_day(full_name: str, d: date) -> str:
     wd = d.weekday()
     day_ru = WEEKDAY_RU[wd]
     header = f"<b>{day_ru}, {d.strftime('%d.%m.%Y')}</b>"
+
     if not lessons:
         return header + "\nНет уроков 🎉"
+
     lines = [header]
     for r in lessons:
         lines.append(
@@ -218,25 +220,31 @@ def format_day(full_name: str, d: date) -> str:
         )
     return "\n".join(lines)
 
+
 def format_week(full_name: str, base: date) -> str:
     monday = base - timedelta(days=base.weekday())
     days = [monday + timedelta(days=i) for i in range(5)]
+
     header = f"<b>Неделя {days[0].strftime('%d.%m')}–{days[-1].strftime('%d.%m')}</b>"
     lines = [header]
+
     for d in days:
-        lessons = get_lessons(full_name, d)
         wd = d.weekday()
         day_ru = WEEKDAY_RU[wd]
+        lines.append(f"\n<b>{day_ru}</b>")
+
+        lessons = get_lessons(full_name, d)
         if not lessons:
-            lines.append(f"{day_ru}: —")
-        else:
-            lines.append(f"<u>{day_ru}</u>")
-            for r in lessons:
-                lines.append(
-                    f"  • {r['урок']}. {r['начало']}-{r['конец']} — {r['предмет']} ({r['класс-столбец']})"
-                )
-    return "
-".join(lines)
+            lines.append("• Нет уроков 🎉")
+            continue
+
+        for r in lessons:
+            lines.append(
+                f"• {r['урок']}. {r['начало']}-{r['конец']} — <b>{r['предмет']}</b> ({r['класс-столбец']})"
+            )
+
+    return "\n".join(lines)
+
 
 # ------------------------------
 #   УВЕДОМЛЕНИЯ (УТРОМ)
