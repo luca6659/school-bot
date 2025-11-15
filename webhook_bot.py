@@ -588,7 +588,7 @@ async def quiz_answer(m: Message):
         return await m.answer(f"❌ Неверно. Правильно: <b>{q['ans']}</b>. Напиши «квиз», чтобы начать заново.")
 
 # ---------- Сюрприз дня ----------
-@dp.message(Command("surprise")))
+@dp.message(Command("surprise"))
 async def surprise_cmd(m: Message):
     u = get_user(m.from_user.id)
     tzinfo = ZoneInfo((u["timezone"] if u else DEFAULT_TZ))
