@@ -670,7 +670,7 @@ async def btn_admin_menu(m: Message):
 #   РЕГИСТРАЦИЯ ФИО (ЛЮБОЙ ДРУГОЙ ТЕКСТ БЕЗ КОМАНД)
 # ------------------------------
 
-@dp.message(~Command())
+@dp.message(F.text, ~F.text.startswith("/"))
 async def register_name(m: Message):
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
