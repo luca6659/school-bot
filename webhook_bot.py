@@ -669,7 +669,7 @@ async def cmd_broadcast(m: Message):
         return await m.answer("❌ У тебя нет прав администратора.")
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await m.answer("Использование: /broadcast <текст>")
+        return await m.answer("Использование: /broadcast [текст]")
     text = parts[1]
     with closing(db()) as conn:
         rows = conn.execute("SELECT tg_id, banned FROM users").fetchall()
@@ -693,7 +693,7 @@ async def cmd_admin(m: Message):
         "🛠 <b>Админ-меню</b>\n"
         "/ban Фамилия Имя — заблокировать\n"
         "/unban Фамилия Имя — разбанить\n"
-        "/broadcast <текст> — рассылка\n"
+        "/broadcast [текст] — рассылка\n"
         "/reload_schedule — перечитать CSV\n"
         "/stats — статистика пользователей",
         reply_markup=main_menu(True),
