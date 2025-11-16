@@ -43,7 +43,7 @@ DEFAULT_TZ = "Europe/Moscow"
 # Файл расписания
 SCHEDULE_CSV = "personal_schedule_all.csv"
 
-# Админы
+# Админы (Александра Антоновна и Алексей Михайлович)
 ADMINS = {7454117594, 5729574721}
 
 # ------------------------------
@@ -186,6 +186,17 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     ]
     if is_admin:
         kb.append([KeyboardButton(text="🛠 Админ-меню")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def games_menu() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="🎲 Кубик"), KeyboardButton(text="🎯 Дартс")],
+        [KeyboardButton(text="⚽ Футбол"), KeyboardButton(text="🏀 Баскетбол")],
+        [KeyboardButton(text="🎳 Боулинг"), KeyboardButton(text="🎰 Казино")],
+        [KeyboardButton(text="❓ Угадай число"), KeyboardButton(text="✂️ Камень-ножницы-бумага")],
+        [KeyboardButton(text="⬅️ В главное меню")],
+    ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
@@ -461,25 +472,64 @@ GUESS_GAME = {}
 @dp.message(Command("games"))
 async def cmd_games(m: Message):
     await m.answer(
-        "🎮 <b>Игры</b>\n"
-        "• Напиши «монета» — орёл/решка\n"
-        "• Напиши «угадай» — я загадаю число 1–20\n"
-        "• Напиши «камень», «ножницы» или «бумага» — сыграем в КНБ",
+        "🎮 Выбирай игру из меню ниже 👇",
+        reply_markup=games_menu(),
+    )
+
+
+@dp.message(F.text == "🎮 Игры")
+async def btn_games(m: Message):
+    await cmd_games(m)
+
+
+@dp.message(F.text == "⬅️ В главное меню")
+async def btn_back_to_main(m: Message):
+    await m.answer(
+        "Возвращаемся в главное меню.",
         reply_markup=main_menu(is_admin(m.from_user.id)),
     )
 
 
-@dp.message(F.text.func(lambda s: s is not None and s.lower() == "монета"))
-async def game_coin(m: Message):
-    result = random.choice(["орёл", "решка"])
-    await m.answer(f"🪙 Выпало: <b>{result}</b>")
+# Кнопочные игры с эмодзи (кубик, дартс и т.д.)
+
+@dp.message(F.text == "🎲 Кубик")
+async def game_dice(m: Message):
+    await bot.send_dice(m.chat.id, emoji="🎲")
 
 
-@dp.message(F.text.func(lambda s: s is not None and s.lower() == "угадай"))
+@dp.message(F.text == "🎯 Дартс")
+async def game_darts(m: Message):
+    await bot.send_dice(m.chat.id, emoji="🎯")
+
+
+@dp.message(F.text == "⚽ Футбол")
+async def game_football(m: Message):
+    await bot.send_dice(m.chat.id, emoji="⚽")
+
+
+@dp.message(F.text == "🏀 Баскетбол")
+async def game_basketball(m: Message):
+    await bot.send_dice(m.chat.id, emoji="🏀")
+
+
+@dp.message(F.text == "🎳 Боулинг")
+async def game_bowling(m: Message):
+    await bot.send_dice(m.chat.id, emoji="🎳")
+
+
+@dp.message(F.text == "🎰 Казино")
+async def game_casino(m: Message):
+    await bot.send_dice(m.chat.id, emoji="🎰")
+
+
+# Угадай число (1–20)
+
+@dp.message(F.text == "❓ Угадай число")
 async def game_guess_start(m: Message):
     GUESS_GAME[m.from_user.id] = {"number": random.randint(1, 20), "tries": 0}
     await m.answer(
-        "Я загадал число от 1 до 20. Пиши числа, а я скажу больше/меньше. Напиши «стоп», чтобы выйти."
+        "Я загадал число от 1 до 20. Пиши числа, а я скажу больше/меньше.\n"
+        "Напиши «стоп», чтобы выйти из игры."
     )
 
 
@@ -506,6 +556,15 @@ async def game_guess_number(m: Message):
         await m.answer("Моё число больше ↑")
     else:
         await m.answer("Моё число меньше ↓")
+
+
+# Камень-ножницы-бумага
+
+@dp.message(F.text == "✂️ Камень-ножницы-бумага")
+async def game_rps_help(m: Message):
+    await m.answer(
+        "Напиши слово: «камень», «ножницы» или «бумага», и я сыграю с тобой 🙂"
+    )
 
 
 @dp.message(F.text.func(lambda s: s is not None and s.lower() in {"камень", "ножницы", "бумага"}))
@@ -539,6 +598,11 @@ async def cmd_surprise(m: Message):
     )
 
 
+@dp.message(F.text == "🎁 Сюрприз дня")
+async def btn_surprise(m: Message):
+    await cmd_surprise(m)
+
+
 # ------------------------------
 #   АДМИН-КОМАНДЫ
 # ------------------------------
@@ -547,28 +611,56 @@ async def cmd_surprise(m: Message):
 async def cmd_ban(m: Message):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ У тебя нет прав администратора.")
-    parts = m.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await m.answer("Использование: /ban <tg_id>")
-    target_id = int(parts[1])
-    ensure_user(target_id)
-    set_banned(target_id, True)
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Использование: /ban Фамилия Имя")
+    name = parts[1].strip()
+
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)",
+            (name,),
+        ).fetchall()
+
+    if not rows:
+        return await m.answer(f"Пользователь с ФИО «{name}» не найден.")
+    if len(rows) > 1:
+        text = "Найдено несколько пользователей с таким ФИО:\n"
+        text += "\n".join(f"• {r[1]} (id={r[0]}, banned={r[2]})" for r in rows)
+        return await m.answer(text)
+
+    tg_id, full_name, banned = rows[0]
+    set_banned(tg_id, True)
     schedule_all_morning()
-    await m.answer(f"🚫 Пользователь {target_id} заблокирован.")
+    await m.answer(f"🚫 Пользователь <b>{full_name}</b> заблокирован.")
 
 
 @dp.message(Command("unban"))
 async def cmd_unban(m: Message):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ У тебя нет прав администратора.")
-    parts = m.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await m.answer("Использование: /unban <tg_id>")
-    target_id = int(parts[1])
-    ensure_user(target_id)
-    set_banned(target_id, False)
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Использование: /unban Фамилия Имя")
+    name = parts[1].strip()
+
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)",
+            (name,),
+        ).fetchall()
+
+    if not rows:
+        return await m.answer(f"Пользователь с ФИО «{name}» не найден.")
+    if len(rows) > 1:
+        text = "Найдено несколько пользователей с таким ФИО:\n"
+        text += "\n".join(f"• {r[1]} (id={r[0]}, banned={r[2]})" for r in rows)
+        return await m.answer(text)
+
+    tg_id, full_name, banned = rows[0]
+    set_banned(tg_id, False)
     schedule_all_morning()
-    await m.answer(f"✅ Пользователь {target_id} разбанен.")
+    await m.answer(f"✅ Пользователь <b>{full_name}</b> разбанен.")
 
 
 @dp.message(Command("broadcast"))
@@ -599,13 +691,18 @@ async def cmd_admin(m: Message):
         return await m.answer("❌ У тебя нет прав администратора.")
     await m.answer(
         "🛠 <b>Админ-меню</b>\n"
-        "/ban <id> — заблокировать\n"
-        "/unban <id> — разбанить\n"
+        "/ban Фамилия Имя — заблокировать\n"
+        "/unban Фамилия Имя — разбанить\n"
         "/broadcast <текст> — рассылка\n"
         "/reload_schedule — перечитать CSV\n"
         "/stats — статистика пользователей",
         reply_markup=main_menu(True),
     )
+
+
+@dp.message(F.text == "🛠 Админ-меню")
+async def btn_admin_menu(m: Message):
+    await cmd_admin(m)
 
 
 @dp.message(Command("reload_schedule"))
@@ -649,21 +746,6 @@ async def btn_week(m: Message):
 @dp.message(F.text == "👤 Профиль")
 async def btn_profile(m: Message):
     await cmd_whoami(m)
-
-
-@dp.message(F.text == "🎮 Игры")
-async def btn_games(m: Message):
-    await cmd_games(m)
-
-
-@dp.message(F.text == "🎁 Сюрприз дня")
-async def btn_surprise(m: Message):
-    await cmd_surprise(m)
-
-
-@dp.message(F.text == "🛠 Админ-меню")
-async def btn_admin_menu(m: Message):
-    await cmd_admin(m)
 
 
 # ------------------------------
