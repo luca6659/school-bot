@@ -200,6 +200,15 @@ def games_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
+def admin_menu_kb() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📚 Перечитать расписание")],
+        [KeyboardButton(text="🚫 Заблокировать ученика"), KeyboardButton(text="✅ Разблокировать ученика")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="⬅️ В главное меню")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
 # ------------------------------
 #   БОТ И ДИСПЕТЧЕР
 # ------------------------------
@@ -467,6 +476,7 @@ async def cmd_notify_off(m: Message):
 # ------------------------------
 
 GUESS_GAME = {}
+ADMIN_STATE = {}  # {tg_id: {"mode": "ban" | "unban" | "broadcast"}}
 
 
 @dp.message(Command("games"))
@@ -690,18 +700,16 @@ async def cmd_admin(m: Message):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ У тебя нет прав администратора.")
     await m.answer(
-        "🛠 <b>Админ-меню</b>\n"
-        "/ban Фамилия Имя — заблокировать\n"
-        "/unban Фамилия Имя — разбанить\n"
-        "/broadcast [текст] — рассылка\n"
-        "/reload_schedule — перечитать CSV\n"
-        "/stats — статистика пользователей",
-        reply_markup=main_menu(True),
+        "🛠 <b>Админ-панель</b>\n"
+        "Выбирай действие кнопками ниже 👇",
+        reply_markup=admin_menu_kb(),
     )
 
 
 @dp.message(F.text == "🛠 Админ-меню")
 async def btn_admin_menu(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ У тебя нет прав администратора.")
     await cmd_admin(m)
 
 
@@ -710,7 +718,7 @@ async def cmd_reload_schedule(m: Message):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ У тебя нет прав администратора.")
     load_personal()
-    await m.answer("📚 Расписание перечитано из CSV.")
+    await m.answer("📚 Расписание перечитано из CSV.", reply_markup=admin_menu_kb())
 
 
 @dp.message(Command("stats"))
@@ -725,7 +733,60 @@ async def cmd_stats(m: Message):
         "📊 <b>Статистика</b>\n"
         f"Всего пользователей: {total}\n"
         f"С указ. ФИО: {with_name}\n"
-        f"Заблокировано: {banned}"
+        f"Заблокировано: {banned}",
+        reply_markup=admin_menu_kb(),
+    )
+
+
+# --------- КНОПКИ АДМИН-ПАНЕЛИ ---------
+
+@dp.message(F.text == "📊 Статистика")
+async def btn_admin_stats(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    await cmd_stats(m)
+
+
+@dp.message(F.text == "📚 Перечитать расписание")
+async def btn_admin_reload_schedule(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    await cmd_reload_schedule(m)
+
+
+@dp.message(F.text == "🚫 Заблокировать ученика")
+async def btn_admin_ban_mode(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    ADMIN_STATE[m.from_user.id] = {"mode": "ban"}
+    await m.answer(
+        "Введи ФИО ученика, которого нужно заблокировать (точно как в списке):\n"
+        "<i>Например: Иванов Иван</i>",
+        reply_markup=admin_menu_kb(),
+    )
+
+
+@dp.message(F.text == "✅ Разблокировать ученика")
+async def btn_admin_unban_mode(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    ADMIN_STATE[m.from_user.id] = {"mode": "unban"}
+    await m.answer(
+        "Введи ФИО ученика, которого нужно разблокировать (точно как в списке):\n"
+        "<i>Например: Иванов Иван</i>",
+        reply_markup=admin_menu_kb(),
+    )
+
+
+@dp.message(F.text == "📢 Рассылка")
+async def btn_admin_broadcast_mode(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    ADMIN_STATE[m.from_user.id] = {"mode": "broadcast"}
+    await m.answer(
+        "Отправь текст рассылки одним сообщением.\n"
+        "Я отправлю его всем незаблокированным пользователям.",
+        reply_markup=admin_menu_kb(),
     )
 
 
@@ -749,11 +810,97 @@ async def btn_profile(m: Message):
 
 
 # ------------------------------
-#   РЕГИСТРАЦИЯ ФИО (ЛЮБОЙ ДРУГОЙ ТЕКСТ БЕЗ КОМАНД)
+#   РЕГИСТРАЦИЯ ФИО / АДМИН-РЕЖИМЫ
 # ------------------------------
 
 @dp.message(F.text, ~F.text.startswith("/"))
 async def register_name(m: Message):
+    # Сначала проверяем: может, админ сейчас в режиме ban/unban/broadcast
+    if is_admin(m.from_user.id):
+        state = ADMIN_STATE.get(m.from_user.id)
+        if state:
+            mode = state.get("mode")
+            text = (m.text or "").strip()
+            ADMIN_STATE.pop(m.from_user.id, None)
+
+            # ----- BAN -----
+            if mode == "ban":
+                name = text
+                with closing(db()) as conn:
+                    rows = conn.execute(
+                        "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)",
+                        (name,),
+                    ).fetchall()
+
+                if not rows:
+                    return await m.answer(
+                        f"Пользователь с ФИО «{name}» не найден.",
+                        reply_markup=admin_menu_kb(),
+                    )
+                if len(rows) > 1:
+                    txt = "Найдено несколько пользователей с таким ФИО:\n"
+                    txt += "\n".join(f"• {r[1]} (id={r[0]}, banned={r[2]})" for r in rows)
+                    return await m.answer(txt, reply_markup=admin_menu_kb())
+
+                tg_id, full_name, banned = rows[0]
+                set_banned(tg_id, True)
+                schedule_all_morning()
+                return await m.answer(
+                    f"🚫 Пользователь <b>{full_name}</b> заблокирован.",
+                    reply_markup=admin_menu_kb(),
+                )
+
+            # ----- UNBAN -----
+            if mode == "unban":
+                name = text
+                with closing(db()) as conn:
+                    rows = conn.execute(
+                        "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)",
+                        (name,),
+                    ).fetchall()
+
+                if not rows:
+                    return await m.answer(
+                        f"Пользователь с ФИО «{name}» не найден.",
+                        reply_markup=admin_menu_kb(),
+                    )
+                if len(rows) > 1:
+                    txt = "Найдено несколько пользователей с таким ФИО:\n"
+                    txt += "\n".join(f"• {r[1]} (id={r[0]}, banned={r[2]})" for r in rows)
+                    return await m.answer(txt, reply_markup=admin_menu_kb())
+
+                tg_id, full_name, banned = rows[0]
+                set_banned(tg_id, False)
+                schedule_all_morning()
+                return await m.answer(
+                    f"✅ Пользователь <b>{full_name}</b> разбанен.",
+                    reply_markup=admin_menu_kb(),
+                )
+
+            # ----- BROADCAST -----
+            if mode == "broadcast":
+                broadcast_text = text
+                sent = 0
+                with closing(db()) as conn:
+                    rows = conn.execute("SELECT tg_id, banned FROM users").fetchall()
+                for tg_id, banned in rows:
+                    if banned:
+                        continue
+                    try:
+                        await bot.send_message(
+                            tg_id,
+                            f"📢 <b>Объявление</b>\n{broadcast_text}",
+                        )
+                        sent += 1
+                    except Exception as e:
+                        logger.warning("Failed broadcast to %s: %s", tg_id, e)
+                return await m.answer(
+                    f"Готово. Отправлено {sent} пользователям.",
+                    reply_markup=admin_menu_kb(),
+                )
+
+    # --- Обычная логика регистрации ФИО ---
+
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
 
