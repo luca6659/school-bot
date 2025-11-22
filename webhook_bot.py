@@ -46,6 +46,9 @@ SCHEDULE_CSV = "personal_schedule_all.csv"
 # Админы (Александра Антоновна и Алексей Михайлович)
 ADMINS = {7454117594, 5729574721}
 
+# Тьютор (для личного чата)
+TUTOR_ID = 5729574721
+
 # ------------------------------
 #   ЛОГИ
 # ------------------------------
@@ -182,6 +185,8 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📆 Неделя")],
         [KeyboardButton(text="🎮 Игры"), KeyboardButton(text="🎁 Сюрприз дня")],
+        [KeyboardButton(text="⏰ Напоминания")],
+        [KeyboardButton(text="💬 Личный чат с тьютором")],
         [KeyboardButton(text="👤 Профиль")],
     ]
     if is_admin:
@@ -205,6 +210,15 @@ def admin_menu_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📚 Перечитать расписание")],
         [KeyboardButton(text="🚫 Заблокировать ученика"), KeyboardButton(text="✅ Разблокировать ученика")],
         [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="⬅️ В главное меню")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def reminders_menu() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="🔔 Включить напоминания")],
+        [KeyboardButton(text="🔕 Выключить напоминания")],
+        [KeyboardButton(text="⬅️ В главное меню")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -283,7 +297,7 @@ def format_week(full_name: str, base: date) -> str:
 
 
 # ------------------------------
-#   УВЕДОМЛЕНИЯ (УТРОМ)
+#   УВЕДОМЛЕНИЯ (УТРО + ВОДА)
 # ------------------------------
 
 async def morning_job(chat_id: int, full_name: str, tz_name: str):
@@ -294,6 +308,13 @@ async def morning_job(chat_id: int, full_name: str, tz_name: str):
         await bot.send_message(chat_id, txt)
     except Exception as e:
         logger.warning("Failed to send morning message to %s: %s", chat_id, e)
+
+
+async def water_job(chat_id: int):
+    try:
+        await bot.send_message(chat_id, "💧 Не забудь выпить воды и сделать перерыв!")
+    except Exception as e:
+        logger.warning("Failed to send water reminder to %s: %s", chat_id, e)
 
 
 def schedule_morning_for_user(u):
@@ -318,6 +339,26 @@ def schedule_morning_for_user(u):
     logger.info("Scheduled morning for %s (%s) at 8:00 %s", u["tg_id"], u["full_name"], u["timezone"])
 
 
+def schedule_water_for_user(u):
+    if u["banned"]:
+        return
+    if not u["notify_enabled"]:
+        return
+    jid = f"water_{u['tg_id']}"
+    tz = tz_for(u)
+    scheduler.add_job(
+        water_job,
+        trigger=CronTrigger(hour=14, minute=0, timezone=tz),
+        id=jid,
+        replace_existing=True,
+        args=(u["tg_id"],),
+        misfire_grace_time=3600,
+        max_instances=1,
+        coalesce=True,
+    )
+    logger.info("Scheduled water reminder for %s at 14:00 %s", u["tg_id"], u["timezone"])
+
+
 def schedule_all_morning():
     with closing(db()) as conn:
         rows = conn.execute(
@@ -333,7 +374,8 @@ def schedule_all_morning():
             "banned": bool(banned),
         }
         schedule_morning_for_user(u)
-    logger.info("Rebuilt all morning jobs")
+        schedule_water_for_user(u)
+    logger.info("Rebuilt all morning & water jobs")
 
 
 # ------------------------------
@@ -477,6 +519,7 @@ async def cmd_notify_off(m: Message):
 
 GUESS_GAME = {}
 ADMIN_STATE = {}  # {tg_id: {"mode": "ban" | "unban" | "broadcast"}}
+PRIVATE_CHAT = {}  # {user_id: True} — личный чат с тьютором
 
 
 @dp.message(Command("games"))
@@ -545,9 +588,17 @@ async def game_guess_start(m: Message):
 
 @dp.message(F.text.func(lambda s: s is not None and s.lower() == "стоп"))
 async def game_guess_stop(m: Message):
+    # Остановить игру
+    removed = False
     if m.from_user.id in GUESS_GAME:
         GUESS_GAME.pop(m.from_user.id, None)
-        await m.answer("Ок, игру остановили 🙂")
+        removed = True
+    # Остановить личный чат с тьютором
+    if PRIVATE_CHAT.get(m.from_user.id):
+        PRIVATE_CHAT.pop(m.from_user.id, None)
+        removed = True
+    if removed:
+        await m.answer("Ок, остановили 🙂")
 
 
 @dp.message(F.text.regexp(r"^\d+$"))
@@ -611,6 +662,75 @@ async def cmd_surprise(m: Message):
 @dp.message(F.text == "🎁 Сюрприз дня")
 async def btn_surprise(m: Message):
     await cmd_surprise(m)
+
+
+# ------------------------------
+#   НАПОМИНАНИЯ (МЕНЮ)
+# ------------------------------
+
+@dp.message(F.text == "⏰ Напоминания")
+async def btn_reminders(m: Message):
+    await m.answer(
+        "🔔 <b>Напоминания</b>\n"
+        "Я могу присылать полезные подсказки в течение дня.\n\n"
+        "Выбери действие:",
+        reply_markup=reminders_menu(),
+    )
+
+
+@dp.message(F.text == "🔔 Включить напоминания")
+async def reminders_on(m: Message):
+    ensure_user(m.from_user.id)
+    set_notify(m.from_user.id, True)
+    schedule_all_morning()
+    await m.answer("🔔 Напоминания включены!", reply_markup=reminders_menu())
+
+
+@dp.message(F.text == "🔕 Выключить напоминания")
+async def reminders_off(m: Message):
+    ensure_user(m.from_user.id)
+    set_notify(m.from_user.id, False)
+    schedule_all_morning()
+    await m.answer("🔕 Напоминания выключены.", reply_markup=reminders_menu())
+
+
+# ------------------------------
+#   ЛИЧНЫЙ ЧАТ С ТЬЮТОРОМ
+# ------------------------------
+
+@dp.message(F.text == "💬 Личный чат с тьютором")
+async def btn_tutor_chat(m: Message):
+    ensure_user(m.from_user.id)
+    PRIVATE_CHAT[m.from_user.id] = True
+    await m.answer(
+        "💬 Напиши сообщение — я отправлю его твоему тьютору.\n"
+        "Чтобы выйти из личного чата, напиши: <b>стоп</b>."
+    )
+
+
+@dp.message(F.text, F.from_user.id == TUTOR_ID)
+async def tutor_reply(m: Message):
+    # Формат ответа: /reply ID текст
+    if not m.text.startswith("/reply "):
+        return  # чтобы не ломать другие сообщения тьютора
+
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await m.answer("Использование: /reply user_id текст")
+
+    try:
+        user_id = int(parts[1])
+    except ValueError:
+        return await m.answer("user_id должен быть числом.")
+
+    text = parts[2]
+
+    try:
+        await bot.send_message(user_id, f"💬 Тьютор:\n{text}")
+        await m.answer("Ответ отправлен!")
+    except Exception as e:
+        logger.warning("Failed to send tutor reply to %s: %s", user_id, e)
+        await m.answer(f"Не удалось отправить сообщение пользователю {user_id}.")
 
 
 # ------------------------------
@@ -810,12 +930,12 @@ async def btn_profile(m: Message):
 
 
 # ------------------------------
-#   РЕГИСТРАЦИЯ ФИО / АДМИН-РЕЖИМЫ
+#   РЕГИСТРАЦИЯ ФИО / АДМИН-РЕЖИМЫ / ЛИЧНЫЙ ЧАТ
 # ------------------------------
 
 @dp.message(F.text, ~F.text.startswith("/"))
 async def register_name(m: Message):
-    # Сначала проверяем: может, админ сейчас в режиме ban/unban/broadcast
+    # 1) Если админ в режиме ban/unban/broadcast
     if is_admin(m.from_user.id):
         state = ADMIN_STATE.get(m.from_user.id)
         if state:
@@ -899,7 +1019,22 @@ async def register_name(m: Message):
                     reply_markup=admin_menu_kb(),
                 )
 
-    # --- Обычная логика регистрации ФИО ---
+    # 2) Личный чат с тьютором (для всех, кто включил)
+    if PRIVATE_CHAT.get(m.from_user.id):
+        text = (m.text or "").strip()
+        # "стоп" уже обрабатывается отдельным хэндлером, сюда не попадёт
+        try:
+            await bot.send_message(
+                TUTOR_ID,
+                f"📩 <b>Сообщение от {m.from_user.full_name} (ID {m.from_user.id}):</b>\n\n{text}"
+            )
+            await m.answer("📨 Сообщение отправлено тьютору!")
+        except Exception as e:
+            logger.warning("Failed to forward to tutor from %s: %s", m.from_user.id, e)
+            await m.answer("Не удалось отправить сообщение тьютору.")
+        return
+
+    # 3) Обычная логика регистрации ФИО
 
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
