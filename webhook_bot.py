@@ -708,8 +708,17 @@ async def btn_tutor_chat(m: Message):
     )
 
 
-@dp.message(F.text, F.from_user.id == TUTOR_ID)
+@dp.message(F.text)
 async def tutor_reply(m: Message):
+    if m.from_user.id != TUTOR_ID:
+        return  # это не тьютор — выходим
+
+    if not m.text.startswith("/reply "):
+        return  # игнорируем не-команды
+
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return await m.answer("Использование: /reply user_id текст")
     # Формат ответа: /reply ID текст
     if not m.text.startswith("/reply "):
         return  # чтобы не ломать другие сообщения тьютора
@@ -933,8 +942,12 @@ async def btn_profile(m: Message):
 #   РЕГИСТРАЦИЯ ФИО / АДМИН-РЕЖИМЫ / ЛИЧНЫЙ ЧАТ
 # ------------------------------
 
-@dp.message(F.text, ~F.text.startswith("/"))
+@dp.message(F.text)
 async def register_name(m: Message):
+
+    # Игнорируем кнопки:
+    if m.text in IGNORE_NAMES:
+        return
     # 1) Если админ в режиме ban/unban/broadcast
     if is_admin(m.from_user.id):
         state = ADMIN_STATE.get(m.from_user.id)
@@ -1020,7 +1033,19 @@ async def register_name(m: Message):
                 )
 
     # 2) Личный чат с тьютором (для всех, кто включил)
-    if PRIVATE_CHAT.get(m.from_user.id):
+    if PRIVATE_CHAT.get(m.from_user.id) is True:
+    # пересылаем тьютору
+    try:
+        await bot.send_message(
+            TUTOR_ID,
+            f"📩 <b>Сообщение от {m.from_user.full_name} (ID {m.from_user.id}):</b>\n\n{m.text}"
+        )
+        await m.answer("📨 Сообщение отправлено тьютору!")
+    except Exception as e:
+        logger.error("Tutor forward error: %s", e)
+        await m.answer("⚠️ Ошибка отправки тьютору.")
+
+    return  # ВАЖНО! Чтобы не провалиться в регистрацию ФИО
         text = (m.text or "").strip()
         # "стоп" уже обрабатывается отдельным хэндлером, сюда не попадёт
         try:
