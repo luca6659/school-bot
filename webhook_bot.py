@@ -1033,19 +1033,7 @@ async def register_name(m: Message):
                 )
 
     # 2) Личный чат с тьютором (для всех, кто включил)
-    if PRIVATE_CHAT.get(m.from_user.id) is True:
-    # пересылаем тьютору
-    try:
-        await bot.send_message(
-            TUTOR_ID,
-            f"📩 <b>Сообщение от {m.from_user.full_name} (ID {m.from_user.id}):</b>\n\n{m.text}"
-        )
-        await m.answer("📨 Сообщение отправлено тьютору!")
-    except Exception as e:
-        logger.error("Tutor forward error: %s", e)
-        await m.answer("⚠️ Ошибка отправки тьютору.")
-
-    return  # ВАЖНО! Чтобы не провалиться в регистрацию ФИО
+    if PRIVATE_CHAT.get(m.from_user.id)
         text = (m.text or "").strip()
         # "стоп" уже обрабатывается отдельным хэндлером, сюда не попадёт
         try:
