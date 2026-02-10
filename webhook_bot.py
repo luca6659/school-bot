@@ -684,7 +684,7 @@ async def reminders_off(m: Message):
 
 
 # ------------------------------
-#   ЛИЧНЫЙ ЧАТ С ТЬЮТОРОМ
+#   ЛИЧНЫЙ ЧАТ С ТЬЮТОРОМ + АНОНИМКА
 # ------------------------------
 
 @dp.message(F.text == "💬 Личный чат с тьютором")
@@ -702,9 +702,24 @@ async def btn_tutor_chat(m: Message):
     )
 
 
-# Тьютор отвечает так: /reply 123456789 текст
+@dp.message(F.text == "❓ Анонимный вопрос")
+async def btn_anon_question(m: Message):
+    ensure_user(m.from_user.id)
+    u = get_user(m.from_user.id)
+    if u and u["banned"]:
+        return await m.answer("🚫 Ты заблокирован.", reply_markup=main_menu(is_admin(m.from_user.id)))
+
+    ANON_ASK[m.from_user.id] = True
+    PRIVATE_CHAT.pop(m.from_user.id, None)
+    await m.answer(
+        "❓ Напиши вопрос — я отправлю его тьютору <b>анонимно</b>.\n"
+        "Чтобы отменить, напиши: <b>стоп</b>."
+    )
+
+
+# Тьютор отвечает: /reply user_id текст
 @dp.message(F.text)
-async def tutor_reply(m: Message):
+async def tutor_reply_only_for_tutor(m: Message):
     if m.from_user.id != TUTOR_ID:
         return
     if not (m.text or "").startswith("/reply "):
@@ -726,25 +741,6 @@ async def tutor_reply(m: Message):
     except Exception as e:
         logger.warning("Failed to send tutor reply to %s: %s", user_id, e)
         await m.answer(f"⚠️ Не удалось отправить пользователю {user_id}.")
-
-
-# ------------------------------
-#   АНОНИМНЫЙ ВОПРОС
-# ------------------------------
-
-@dp.message(F.text == "❓ Анонимный вопрос")
-async def btn_anon_question(m: Message):
-    ensure_user(m.from_user.id)
-    u = get_user(m.from_user.id)
-    if u and u["banned"]:
-        return await m.answer("🚫 Ты заблокирован.", reply_markup=main_menu(is_admin(m.from_user.id)))
-
-    ANON_ASK[m.from_user.id] = True
-    PRIVATE_CHAT.pop(m.from_user.id, None)
-    await m.answer(
-        "❓ Напиши свой вопрос — я отправлю его тьютору <b>анонимно</b>.\n"
-        "Чтобы отменить, напиши: <b>стоп</b>."
-    )
 
 
 # ------------------------------
@@ -802,28 +798,6 @@ async def btn_admin_reload_schedule(m: Message):
     await cmd_reload_schedule(m)
 
 
-@dp.message(Command("ban"))
-async def cmd_ban(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ У тебя нет прав администратора.")
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        return await m.answer("Использование: /ban Фамилия Имя")
-    name = parts[1].strip()
-    await _ban_by_name(m, name)
-
-
-@dp.message(Command("unban"))
-async def cmd_unban(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ У тебя нет прав администратора.")
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        return await m.answer("Использование: /unban Фамилия Имя")
-    name = parts[1].strip()
-    await _unban_by_name(m, name)
-
-
 async def _ban_by_name(m: Message, name: str):
     with closing(db()) as conn:
         rows = conn.execute(
@@ -866,6 +840,53 @@ async def _unban_by_name(m: Message, name: str):
     await m.answer(f"✅ Пользователь <b>{full_name}</b> разбанен.", reply_markup=admin_menu_kb())
 
 
+@dp.message(Command("ban"))
+async def cmd_ban(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ У тебя нет прав администратора.")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Использование: /ban Фамилия Имя")
+    await _ban_by_name(m, parts[1].strip())
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ У тебя нет прав администратора.")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Использование: /unban Фамилия Имя")
+    await _unban_by_name(m, parts[1].strip())
+
+
+async def _do_broadcast(m: Message, text: str):
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT tg_id, banned FROM users").fetchall()
+
+    sent = 0
+    for tg_id, banned in rows:
+        if banned:
+            continue
+        try:
+            await bot.send_message(tg_id, f"📢 <b>Объявление</b>\n{text}")
+            sent += 1
+        except Exception as e:
+            logger.warning("Failed broadcast to %s: %s", tg_id, e)
+
+    await m.answer(f"Готово. Отправлено {sent} пользователям.", reply_markup=admin_menu_kb())
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ У тебя нет прав администратора.")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Использование: /broadcast [текст]")
+    await _do_broadcast(m, parts[1])
+
+
 @dp.message(F.text == "🚫 Заблокировать ученика")
 async def btn_admin_ban_mode(m: Message):
     if not is_admin(m.from_user.id):
@@ -890,33 +911,6 @@ async def btn_admin_unban_mode(m: Message):
     )
 
 
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ У тебя нет прав администратора.")
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        return await m.answer("Использование: /broadcast [текст]")
-    await _do_broadcast(m, parts[1])
-
-
-async def _do_broadcast(m: Message, text: str):
-    with closing(db()) as conn:
-        rows = conn.execute("SELECT tg_id, banned FROM users").fetchall()
-
-    sent = 0
-    for tg_id, banned in rows:
-        if banned:
-            continue
-        try:
-            await bot.send_message(tg_id, f"📢 <b>Объявление</b>\n{text}")
-            sent += 1
-        except Exception as e:
-            logger.warning("Failed broadcast to %s: %s", tg_id, e)
-
-    await m.answer(f"Готово. Отправлено {sent} пользователям.", reply_markup=admin_menu_kb())
-
-
 @dp.message(F.text == "📢 Рассылка")
 async def btn_admin_broadcast_mode(m: Message):
     if not is_admin(m.from_user.id):
@@ -926,7 +920,7 @@ async def btn_admin_broadcast_mode(m: Message):
 
 
 # ------------------------------
-#   ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТА (ВАЖНО!)
+#   ЕДИНЫЙ РОУТЕР ТЕКСТА (регистрация + чат + анонимка + админ-состояния)
 # ------------------------------
 
 @dp.message(F.text)
@@ -934,21 +928,23 @@ async def text_router(m: Message):
     text = (m.text or "").strip()
     lower = text.lower()
 
-    # Команды уже обработаны другими хэндлерами
+    # 0) тьюторские /reply уже обработаны в tutor_reply_only_for_tutor
+    if m.from_user.id == TUTOR_ID and text.startswith("/reply "):
+        return
+
+    # 1) кнопки/команды уже разобраны отдельными хэндлерами, но текст всё равно может попасть сюда.
+    # Просто пропускаем явные команды:
     if text.startswith("/"):
         return
 
-    # Универсальный выход
+    # 2) Универсальный выход "стоп"
     if lower == "стоп":
         stopped_any = False
-
         if m.from_user.id in GUESS_GAME:
             GUESS_GAME.pop(m.from_user.id, None)
             stopped_any = True
-
         if PRIVATE_CHAT.pop(m.from_user.id, None) is not None:
             stopped_any = True
-
         if ANON_ASK.pop(m.from_user.id, None) is not None:
             stopped_any = True
 
@@ -956,13 +952,12 @@ async def text_router(m: Message):
             await m.answer("Ок, остановили 🙂", reply_markup=main_menu(is_admin(m.from_user.id)))
         return
 
-    # 1) Админ-режимы (ban/unban/broadcast через кнопки)
+    # 3) Админ-состояния (ban/unban/broadcast) — только для админов
     if is_admin(m.from_user.id):
         st = ADMIN_STATE.get(m.from_user.id)
         if st:
             mode = st.get("mode")
             ADMIN_STATE.pop(m.from_user.id, None)
-
             if mode == "ban":
                 return await _ban_by_name(m, text)
             if mode == "unban":
@@ -970,7 +965,7 @@ async def text_router(m: Message):
             if mode == "broadcast":
                 return await _do_broadcast(m, text)
 
-    # 2) Личный чат с тьютором
+    # 4) Личный чат с тьютором
     if PRIVATE_CHAT.get(m.from_user.id) is True:
         ensure_user(m.from_user.id)
         u = get_user(m.from_user.id)
@@ -989,7 +984,7 @@ async def text_router(m: Message):
             await m.answer("⚠️ Ошибка отправки тьютору.")
         return
 
-    # 3) Анонимный вопрос
+    # 5) Анонимный вопрос
     if ANON_ASK.get(m.from_user.id) is True:
         ensure_user(m.from_user.id)
         u = get_user(m.from_user.id)
@@ -999,17 +994,14 @@ async def text_router(m: Message):
 
         ANON_ASK.pop(m.from_user.id, None)
         try:
-            await bot.send_message(
-                TUTOR_ID,
-                "❓ <b>Анонимный вопрос:</b>\n\n" + text
-            )
+            await bot.send_message(TUTOR_ID, "❓ <b>Анонимный вопрос:</b>\n\n" + text)
             await m.answer("✅ Вопрос отправлен тьютору анонимно.")
         except Exception as e:
             logger.error("Anon ask error: %s", e)
             await m.answer("⚠️ Не удалось отправить вопрос.")
         return
 
-    # 4) Регистрация ФИО (если ФИО пустое)
+    # 6) Регистрация ФИО (если ФИО пустое)
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
 
@@ -1035,14 +1027,14 @@ async def text_router(m: Message):
             msg += "\n".join(f"• {s}" for s in suggestions)
             msg += "\n\nСкопируй правильный вариант и пришли ещё раз."
             return await m.answer(msg, reply_markup=main_menu(is_admin(m.from_user.id)))
-        else:
-            return await m.answer(
-                "Я не нашёл такое ФИО в списке 🙈\nПроверь написание и пришли ещё раз.",
-                reply_markup=main_menu(is_admin(m.from_user.id)),
-            )
 
-    # 5) Если пользователь уже зарегистрирован — просто подсказка
-    await m.answer("Я понял 🙂 Пользуйся кнопками меню 👇", reply_markup=main_menu(is_admin(m.from_user.id)))
+        return await m.answer(
+            "Я не нашёл такое ФИО в списке 🙈\nПроверь написание и пришли ещё раз.",
+            reply_markup=main_menu(is_admin(m.from_user.id)),
+        )
+
+    # 7) Пользователь зарегистрирован — просто подсказка
+    await m.answer("Пользуйся кнопками меню 👇", reply_markup=main_menu(is_admin(m.from_user.id)))
 
 
 # ------------------------------
