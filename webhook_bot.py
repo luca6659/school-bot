@@ -13,6 +13,9 @@ from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -26,18 +29,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "7977975083:AAFKM15DQm3ov2rvSklus2Ju24mlaz001
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# часовой пояс Москва
 DEFAULT_TZ = "Europe/Moscow"
-
-# Файл расписания
 SCHEDULE_CSV = "personal_schedule_all.csv"
-
-# Папка для данных (bothost сохраняет /app/data при перезапуске)
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Админы (Александра Антоновна и Алексей Михайлович)
 ADMINS = {7454117594, 5729574721}
+
+# Последний день учёбы перед летними каникулами
+SUMMER_START = date(2026, 5, 25)
 
 # ------------------------------
 #   ЛОГИ
@@ -45,6 +45,13 @@ ADMINS = {7454117594, 5729574721}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bot")
+
+# ------------------------------
+#   FSM STATES
+# ------------------------------
+
+class BroadcastState(StatesGroup):
+    waiting_message = State()
 
 # ------------------------------
 #   БАЗА ДАННЫХ
@@ -123,6 +130,23 @@ def set_timezone(tg_id: int, tz: str):
         conn.execute("UPDATE users SET timezone=? WHERE tg_id=?", (tz, tg_id))
 
 
+def get_all_users():
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT tg_id, full_name, timezone, notify_enabled, banned FROM users"
+        ).fetchall()
+    return [
+        {
+            "tg_id": r[0],
+            "full_name": r[1],
+            "timezone": r[2],
+            "notify_enabled": bool(r[3]),
+            "banned": bool(r[4]),
+        }
+        for r in rows
+    ]
+
+
 # ------------------------------
 #   ЗАГРУЗКА РАСПИСАНИЯ CSV
 # ------------------------------
@@ -168,17 +192,34 @@ def get_lessons(full_name: str, d: date):
 
 
 # ------------------------------
+#   СЧЁТЧИК ДО КАНИКУЛ
+# ------------------------------
+
+def days_to_summer() -> str:
+    today = date.today()
+    if today >= SUMMER_START:
+        return "🎉 Каникулы уже начались! Отдыхай!"
+    delta = (SUMMER_START - today).days
+    if delta == 1:
+        ending = "день"
+    elif 2 <= delta <= 4:
+        ending = "дня"
+    else:
+        ending = "дней"
+    return f"☀️ До летних каникул осталось <b>{delta} {ending}</b>!\n({SUMMER_START.strftime('%d.%m.%Y')})"
+
+
+# ------------------------------
 #   МЕНЮ КЛАВИАТУРЫ
 # ------------------------------
 
-
-def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
+def main_menu(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📆 Неделя")],
         [KeyboardButton(text="🎮 Игры"), KeyboardButton(text="🎁 Сюрприз дня")],
-        [KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="☀️ До каникул"), KeyboardButton(text="👤 Профиль")],
     ]
-    if is_admin:
+    if is_admin_user:
         kb.append([KeyboardButton(text="🛠 Админ-меню")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -194,19 +235,60 @@ def games_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
+def profile_menu(notify_enabled: bool) -> ReplyKeyboardMarkup:
+    notify_btn = "🔕 Выкл. уведомления" if notify_enabled else "🔔 Вкл. уведомления"
+    kb = [
+        [KeyboardButton(text=notify_btn)],
+        [KeyboardButton(text="🌍 Сменить часовой пояс")],
+        [KeyboardButton(text="⬅️ В главное меню")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def timezone_menu() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="🕐 Москва (UTC+3)"), KeyboardButton(text="🕒 Екатеринбург (UTC+5)")],
+        [KeyboardButton(text="🕔 Новосибирск (UTC+7)"), KeyboardButton(text="🕕 Красноярск (UTC+7)")],
+        [KeyboardButton(text="🕖 Иркутск (UTC+8)"), KeyboardButton(text="🕗 Якутск (UTC+9)")],
+        [KeyboardButton(text="🕘 Владивосток (UTC+10)"), KeyboardButton(text="🕙 Магадан (UTC+11)")],
+        [KeyboardButton(text="🕚 Камчатка (UTC+12)")],
+        [KeyboardButton(text="⬅️ Назад в профиль")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def admin_menu() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
+        [KeyboardButton(text="👥 Список пользователей")],
+        [KeyboardButton(text="⬅️ В главное меню")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+TIMEZONE_MAP = {
+    "🕐 Москва (UTC+3)": "Europe/Moscow",
+    "🕒 Екатеринбург (UTC+5)": "Asia/Yekaterinburg",
+    "🕔 Новосибирск (UTC+7)": "Asia/Novosibirsk",
+    "🕕 Красноярск (UTC+7)": "Asia/Krasnoyarsk",
+    "🕖 Иркутск (UTC+8)": "Asia/Irkutsk",
+    "🕗 Якутск (UTC+9)": "Asia/Yakutsk",
+    "🕘 Владивосток (UTC+10)": "Asia/Vladivostok",
+    "🕙 Магадан (UTC+11)": "Asia/Magadan",
+    "🕚 Камчатка (UTC+12)": "Asia/Kamchatka",
+}
+
 # ------------------------------
 #   БОТ И ДИСПЕТЧЕР
 # ------------------------------
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
-
 
 # ------------------------------
 #   ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ------------------------------
-
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
@@ -231,10 +313,8 @@ def format_day(full_name: str, d: date) -> str:
     wd = d.weekday()
     day_ru = WEEKDAY_RU[wd]
     header = f"<b>{day_ru}, {d.strftime('%d.%m.%Y')}</b>"
-
     if not lessons:
         return header + "\nНет уроков 🎉"
-
     lines = [header]
     for r in lessons:
         lines.append(
@@ -246,32 +326,26 @@ def format_day(full_name: str, d: date) -> str:
 def format_week(full_name: str, base: date) -> str:
     monday = base - timedelta(days=base.weekday())
     days = [monday + timedelta(days=i) for i in range(5)]
-
     header = f"<b>Неделя {days[0].strftime('%d.%m')}–{days[-1].strftime('%d.%m')}</b>"
     lines = [header]
-
     for d in days:
         wd = d.weekday()
         day_ru = WEEKDAY_RU[wd]
         lines.append(f"\n<b>{day_ru}</b>")
-
         lessons = get_lessons(full_name, d)
         if not lessons:
             lines.append("• Нет уроков 🎉")
             continue
-
         for r in lessons:
             lines.append(
                 f"• {r['урок']}. {r['начало']}-{r['конец']} — <b>{r['предмет']}</b> ({r['класс-столбец']})"
             )
-
     return "\n".join(lines)
 
 
 # ------------------------------
 #   УВЕДОМЛЕНИЯ (УТРОМ)
 # ------------------------------
-
 
 async def morning_job(chat_id: int, full_name: str, tz_name: str):
     tz = ZoneInfo(tz_name or DEFAULT_TZ)
@@ -284,11 +358,7 @@ async def morning_job(chat_id: int, full_name: str, tz_name: str):
 
 
 def schedule_morning_for_user(u):
-    if u["banned"]:
-        return
-    if not u["notify_enabled"]:
-        return
-    if not u["full_name"].strip():
+    if u["banned"] or not u["notify_enabled"] or not u["full_name"].strip():
         return
     jid = f"morning_{u['tg_id']}"
     tz = tz_for(u)
@@ -302,23 +372,11 @@ def schedule_morning_for_user(u):
         max_instances=1,
         coalesce=True,
     )
-    logger.info("Scheduled morning for %s (%s) at 8:00 %s", u["tg_id"], u["full_name"], u["timezone"])
 
 
 def schedule_all_morning():
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT tg_id, full_name, timezone, notify_enabled, banned FROM users"
-        ).fetchall()
     scheduler.remove_all_jobs()
-    for tg_id, full_name, timezone, notify_enabled, banned in rows:
-        u = {
-            "tg_id": tg_id,
-            "full_name": full_name,
-            "timezone": timezone,
-            "notify_enabled": bool(notify_enabled),
-            "banned": bool(banned),
-        }
+    for u in get_all_users():
         schedule_morning_for_user(u)
     logger.info("Rebuilt all morning jobs")
 
@@ -349,14 +407,14 @@ def surprise_for_today() -> str:
 #   КОМАНДЫ
 # ------------------------------
 
-
 @dp.message(Command("start"))
-async def cmd_start(m: Message):
+async def cmd_start(m: Message, state: FSMContext):
+    await state.clear()
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
     isadm = is_admin(m.from_user.id)
     if u and u["banned"]:
-        return await m.answer("🚫 Ты заблокирован.", reply_markup=main_menu(isadm))
+        return await m.answer("🚫 Ты заблокирован.")
     if u and u["full_name"].strip():
         return await m.answer(
             f"С возвращением, <b>{u['full_name']}</b>!",
@@ -376,8 +434,12 @@ async def cmd_myid(m: Message):
     await m.answer(f"Твой ID: <code>{m.from_user.id}</code>")
 
 
-@dp.message(Command("today"))
-async def cmd_today(m: Message):
+# ------------------------------
+#   КНОПКИ ГЛАВНОГО МЕНЮ
+# ------------------------------
+
+@dp.message(F.text == "📅 Сегодня")
+async def btn_today(m: Message):
     u = get_user(m.from_user.id)
     msg = guard_or_msg(u)
     if msg:
@@ -387,19 +449,8 @@ async def cmd_today(m: Message):
     await m.answer(format_day(u["full_name"], today))
 
 
-@dp.message(Command("tomorrow"))
-async def cmd_tomorrow(m: Message):
-    u = get_user(m.from_user.id)
-    msg = guard_or_msg(u)
-    if msg:
-        return await m.answer(msg, reply_markup=main_menu(is_admin(m.from_user.id)))
-    tz = tz_for(u)
-    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
-    await m.answer(format_day(u["full_name"], tomorrow))
-
-
-@dp.message(Command("week"))
-async def cmd_week(m: Message):
+@dp.message(F.text == "📆 Неделя")
+async def btn_week(m: Message):
     u = get_user(m.from_user.id)
     msg = guard_or_msg(u)
     if msg:
@@ -409,74 +460,72 @@ async def cmd_week(m: Message):
     await m.answer(format_week(u["full_name"], today))
 
 
-@dp.message(Command("whoami"))
-async def cmd_whoami(m: Message):
+@dp.message(F.text == "☀️ До каникул")
+async def btn_summer(m: Message):
+    await m.answer(days_to_summer())
+
+
+@dp.message(F.text == "🎁 Сюрприз дня")
+async def btn_surprise(m: Message):
+    await m.answer(surprise_for_today())
+
+
+# ------------------------------
+#   ПРОФИЛЬ
+# ------------------------------
+
+@dp.message(F.text == "👤 Профиль")
+async def btn_profile(m: Message):
     u = get_user(m.from_user.id)
     isadm = is_admin(m.from_user.id)
     if not u:
-        return await m.answer(
-            "Ты ещё не зарегистрирован. Напиши свои имя и фамилию.",
-            reply_markup=main_menu(isadm),
-        )
+        return await m.answer("Ты ещё не зарегистрирован.", reply_markup=main_menu(isadm))
     txt = (
         f"👤 <b>Профиль</b>\n"
         f"ID: <code>{u['tg_id']}</code>\n"
         f"ФИО: {u['full_name'] or '—'}\n"
         f"Часовой пояс: {u['timezone']}\n"
-        f"Уведомления: {'включены' if u['notify_enabled'] else 'выключены'}\n"
+        f"Уведомления: {'🔔 включены' if u['notify_enabled'] else '🔕 выключены'}\n"
         f"Статус: {'🚫 заблокирован' if u['banned'] else '✅ активен'}"
     )
-    await m.answer(txt, reply_markup=main_menu(isadm))
+    await m.answer(txt, reply_markup=profile_menu(u["notify_enabled"]))
 
 
-@dp.message(Command("notify_on"))
-async def cmd_notify_on(m: Message):
+@dp.message(F.text == "⬅️ Назад в профиль")
+async def btn_back_to_profile(m: Message):
+    await btn_profile(m)
+
+
+@dp.message(F.text.in_({"🔔 Вкл. уведомления", "🔕 Выкл. уведомления"}))
+async def btn_toggle_notify(m: Message):
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
     if u["banned"]:
-        return await m.answer(
-            "🚫 Ты заблокирован.", reply_markup=main_menu(is_admin(m.from_user.id))
-        )
-    set_notify(m.from_user.id, True)
+        return await m.answer("🚫 Ты заблокирован.")
+    new_val = not u["notify_enabled"]
+    set_notify(m.from_user.id, new_val)
     schedule_all_morning()
-    await m.answer(
-        "🔔 Уведомления включены.", reply_markup=main_menu(is_admin(m.from_user.id))
-    )
-
-
-@dp.message(Command("notify_off"))
-async def cmd_notify_off(m: Message):
-    ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
-    if u["banned"]:
-        return await m.answer(
-            "🚫 Ты заблокирован.", reply_markup=main_menu(is_admin(m.from_user.id))
-        )
-    set_notify(m.from_user.id, False)
+    status = "🔔 Уведомления включены!" if new_val else "🔕 Уведомления выключены!"
+    await m.answer(status, reply_markup=profile_menu(u["notify_enabled"]))
+
+
+@dp.message(F.text == "🌍 Сменить часовой пояс")
+async def btn_change_tz(m: Message):
+    await m.answer("Выбери свой часовой пояс:", reply_markup=timezone_menu())
+
+
+@dp.message(F.text.in_(TIMEZONE_MAP.keys()))
+async def btn_set_tz(m: Message):
+    tz_name = TIMEZONE_MAP[m.text]
+    ensure_user(m.from_user.id)
+    set_timezone(m.from_user.id, tz_name)
     schedule_all_morning()
+    u = get_user(m.from_user.id)
     await m.answer(
-        "🔕 Уведомления выключены.", reply_markup=main_menu(is_admin(m.from_user.id))
+        f"✅ Часовой пояс изменён на <b>{m.text}</b>",
+        reply_markup=profile_menu(u["notify_enabled"]),
     )
-
-
-# ------------------------------
-#   КНОПКИ МЕНЮ
-# ------------------------------
-
-
-@dp.message(F.text == "📅 Сегодня")
-async def btn_today(m: Message):
-    await cmd_today(m)
-
-
-@dp.message(F.text == "📆 Неделя")
-async def btn_week(m: Message):
-    await cmd_week(m)
-
-
-@dp.message(F.text == "👤 Профиль")
-async def btn_profile(m: Message):
-    await cmd_whoami(m)
 
 
 # ------------------------------
@@ -486,25 +535,15 @@ async def btn_profile(m: Message):
 GUESS_GAME = {}
 
 
-@dp.message(Command("games"))
-async def cmd_games(m: Message):
-    await m.answer(
-        "🎮 Выбирай игру из меню ниже 👇",
-        reply_markup=games_menu(),
-    )
-
-
 @dp.message(F.text == "🎮 Игры")
 async def btn_games(m: Message):
-    await cmd_games(m)
+    await m.answer("🎮 Выбирай игру 👇", reply_markup=games_menu())
 
 
 @dp.message(F.text == "⬅️ В главное меню")
-async def btn_back_to_main(m: Message):
-    await m.answer(
-        "Возвращаемся в главное меню.",
-        reply_markup=main_menu(is_admin(m.from_user.id)),
-    )
+async def btn_back_to_main(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Главное меню 👇", reply_markup=main_menu(is_admin(m.from_user.id)))
 
 
 @dp.message(F.text == "🎲 Кубик")
@@ -542,7 +581,7 @@ async def game_guess_start(m: Message):
     GUESS_GAME[m.from_user.id] = {"number": random.randint(1, 20), "tries": 0}
     await m.answer(
         "Я загадал число от 1 до 20. Пиши числа, а я скажу больше/меньше.\n"
-        "Напиши «стоп», чтобы выйти из игры."
+        "Напиши «стоп», чтобы выйти."
     )
 
 
@@ -573,9 +612,7 @@ async def game_guess_number(m: Message):
 
 @dp.message(F.text == "✂️ Камень-ножницы-бумага")
 async def game_rps_help(m: Message):
-    await m.answer(
-        "Напиши слово: «камень», «ножницы» или «бумага», и я сыграю с тобой 🙂"
-    )
+    await m.answer("Напиши: «камень», «ножницы» или «бумага» 🙂")
 
 
 @dp.message(F.text.func(lambda s: s is not None and s.lower() in {"камень", "ножницы", "бумага"}))
@@ -583,7 +620,6 @@ async def game_rps(m: Message):
     user_choice = m.text.lower()
     options = ["камень", "ножницы", "бумага"]
     bot_choice = random.choice(options)
-
     if user_choice == bot_choice:
         result = "🤝 Ничья!"
     elif (
@@ -594,123 +630,147 @@ async def game_rps(m: Message):
         result = "🎉 Ты выиграл!"
     else:
         result = "Я выиграл 😈"
-
     await m.answer(f"Ты: {user_choice}\nБот: {bot_choice}\n\n{result}")
 
 
 # ------------------------------
-#   СЮРПРИЗ ДНЯ
+#   АДМИН-МЕНЮ
 # ------------------------------
 
+@dp.message(F.text == "🛠 Админ-меню")
+async def btn_admin_menu(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    await m.answer("🛠 Админ-панель:", reply_markup=admin_menu())
 
-@dp.message(Command("surprise"))
-async def cmd_surprise(m: Message):
+
+@dp.message(F.text == "📊 Статистика")
+async def btn_stats(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    users = get_all_users()
+    total = len(users)
+    active = sum(1 for u in users if not u["banned"] and u["full_name"].strip())
+    banned = sum(1 for u in users if u["banned"])
+    no_name = sum(1 for u in users if not u["full_name"].strip())
+    notify_on = sum(1 for u in users if u["notify_enabled"] and not u["banned"])
+    txt = (
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: <b>{total}</b>\n"
+        f"✅ Активных: <b>{active}</b>\n"
+        f"🚫 Заблокированных: <b>{banned}</b>\n"
+        f"❓ Без ФИО: <b>{no_name}</b>\n"
+        f"🔔 С уведомлениями: <b>{notify_on}</b>"
+    )
+    await m.answer(txt, reply_markup=admin_menu())
+
+
+@dp.message(F.text == "👥 Список пользователей")
+async def btn_users_list(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    users = get_all_users()
+    if not users:
+        return await m.answer("Нет пользователей.", reply_markup=admin_menu())
+    lines = [f"<b>Пользователи ({len(users)}):</b>"]
+    for u in users:
+        status = "🚫" if u["banned"] else "✅"
+        notify = "🔔" if u["notify_enabled"] else "🔕"
+        lines.append(f"{status}{notify} {u['full_name'] or '—'} (<code>{u['tg_id']}</code>)")
+    await m.answer("\n".join(lines), reply_markup=admin_menu())
+
+
+@dp.message(F.text == "📢 Рассылка")
+async def btn_broadcast_start(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    await state.set_state(BroadcastState.waiting_message)
+    cancel_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена рассылки")]],
+        resize_keyboard=True,
+    )
     await m.answer(
-        surprise_for_today(), reply_markup=main_menu(is_admin(m.from_user.id))
+        "✏️ Напиши сообщение для рассылки всем пользователям.\n"
+        "Нажми «❌ Отмена рассылки» чтобы отменить.",
+        reply_markup=cancel_kb,
     )
 
 
-@dp.message(F.text == "🎁 Сюрприз дня")
-async def btn_surprise(m: Message):
-    await cmd_surprise(m)
+@dp.message(F.text == "❌ Отмена рассылки")
+async def btn_broadcast_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Рассылка отменена.", reply_markup=admin_menu())
 
 
-# ------------------------------
-#   АДМИН-КОМАНДЫ
-# ------------------------------
+@dp.message(BroadcastState.waiting_message)
+async def btn_broadcast_send(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    await state.clear()
+    users = get_all_users()
+    text = f"📢 <b>Сообщение от администратора:</b>\n\n{m.text}"
+    sent = 0
+    failed = 0
+    for u in users:
+        if u["banned"]:
+            continue
+        try:
+            await bot.send_message(u["tg_id"], text)
+            sent += 1
+        except Exception as e:
+            logger.warning("Broadcast failed for %s: %s", u["tg_id"], e)
+            failed += 1
+        await asyncio.sleep(0.05)
+    await m.answer(
+        f"✅ Рассылка завершена!\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>",
+        reply_markup=admin_menu(),
+    )
 
 
 @dp.message(Command("ban"))
 async def cmd_ban(m: Message):
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ У тебя нет прав администратора.")
+        return await m.answer("❌ Нет прав.")
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         return await m.answer("Использование: /ban Фамилия Имя")
     name = parts[1].strip()
-
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)",
-            (name,),
+            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)", (name,)
         ).fetchall()
-
     if not rows:
-        return await m.answer(f"Пользователь с ФИО «{name}» не найден.")
-    if len(rows) > 1:
-        text = "Найдено несколько пользователей с таким ФИО:\n"
-        text += "\n".join(f"• {r[1]} (id={r[0]}, banned={r[2]})" for r in rows)
-        return await m.answer(text)
-
-    tg_id, full_name, banned = rows[0]
+        return await m.answer(f"Пользователь «{name}» не найден.")
+    tg_id, full_name, _ = rows[0]
     set_banned(tg_id, True)
     schedule_all_morning()
-    await m.answer(f"🚫 Пользователь <b>{full_name}</b> заблокирован.")
+    await m.answer(f"🚫 <b>{full_name}</b> заблокирован.")
 
 
 @dp.message(Command("unban"))
 async def cmd_unban(m: Message):
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ У тебя нет прав администратора.")
+        return await m.answer("❌ Нет прав.")
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         return await m.answer("Использование: /unban Фамилия Имя")
     name = parts[1].strip()
-
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)",
-            (name,),
+            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)", (name,)
         ).fetchall()
-
     if not rows:
-        return await m.answer(f"Пользователь с ФИО «{name}» не найден.")
-    if len(rows) > 1:
-        text = "Найдено несколько пользователей с таким ФИО:\n"
-        text += "\n".join(f"• {r[1]} (id={r[0]}, banned={r[2]})" for r in rows)
-        return await m.answer(text)
-
-    tg_id, full_name, banned = rows[0]
+        return await m.answer(f"Пользователь «{name}» не найден.")
+    tg_id, full_name, _ = rows[0]
     set_banned(tg_id, False)
     schedule_all_morning()
-    await m.answer(f"✅ Пользователь <b>{full_name}</b> разблокирован.")
-
-
-@dp.message(Command("users"))
-async def cmd_users(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ У тебя нет прав администратора.")
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT tg_id, full_name, notify_enabled, banned FROM users"
-        ).fetchall()
-    if not rows:
-        return await m.answer("Нет зарегистрированных пользователей.")
-    lines = [f"<b>Пользователи ({len(rows)}):</b>"]
-    for tg_id, full_name, notify_enabled, banned in rows:
-        status = "🚫" if banned else "✅"
-        notify = "🔔" if notify_enabled else "🔕"
-        lines.append(f"{status}{notify} {full_name or '—'} (<code>{tg_id}</code>)")
-    await m.answer("\n".join(lines))
-
-
-@dp.message(F.text == "🛠 Админ-меню")
-async def btn_admin(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ У тебя нет прав администратора.")
-    txt = (
-        "<b>🛠 Админ-команды:</b>\n"
-        "/users — список всех пользователей\n"
-        "/ban Фамилия Имя — заблокировать\n"
-        "/unban Фамилия Имя — разблокировать\n"
-    )
-    await m.answer(txt)
+    await m.answer(f"✅ <b>{full_name}</b> разблокирован.")
 
 
 # ------------------------------
-#   РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ (ввод ФИО)
+#   РЕГИСТРАЦИЯ (ввод ФИО)
 # ------------------------------
-
 
 @dp.message(F.text)
 async def handle_text(m: Message):
@@ -720,24 +780,20 @@ async def handle_text(m: Message):
     if u["banned"]:
         return await m.answer("🚫 Ты заблокирован.")
 
-    # Если ФИО не задано — пробуем зарегистрировать
     if not u["full_name"].strip():
         name = m.text.strip()
-        # Проверяем что имя есть в списке
         if ALL_NAMES and name.lower() not in [n.lower() for n in ALL_NAMES]:
             sample = "\n".join(f"• {n}" for n in ALL_NAMES[:6])
             return await m.answer(
-                f"❌ «{name}» не найден в расписании.\n\nПримеры имён:\n{sample}"
+                f"❌ «{name}» не найден в расписании.\n\nПримеры:\n{sample}"
             )
         set_full_name(m.from_user.id, name)
         schedule_all_morning()
-        u = get_user(m.from_user.id)
         return await m.answer(
-            f"✅ Привет, <b>{name}</b>! Теперь ты зарегистрирован.",
+            f"✅ Привет, <b>{name}</b>! Ты зарегистрирован.",
             reply_markup=main_menu(is_admin(m.from_user.id)),
         )
 
-    # Иначе просто показываем меню
     await m.answer(
         "Используй кнопки меню 👇",
         reply_markup=main_menu(is_admin(m.from_user.id)),
@@ -745,9 +801,8 @@ async def handle_text(m: Message):
 
 
 # ------------------------------
-#   ЗАПУСК (POLLING)
+#   ЗАПУСК
 # ------------------------------
-
 
 async def main():
     create_db()
