@@ -10,7 +10,7 @@ import os
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
@@ -34,6 +34,7 @@ SCHEDULE_CSV = "personal_schedule_all.csv"
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Оба администратора — они же кураторы
 ADMINS = {7454117594, 5729574721}
 
 # Последний день учёбы перед летними каникулами
@@ -52,6 +53,18 @@ logger = logging.getLogger("bot")
 
 class BroadcastState(StatesGroup):
     waiting_message = State()
+
+class QuestionState(StatesGroup):
+    waiting_question = State()
+
+class AnswerState(StatesGroup):
+    waiting_answer = State()
+
+class BanState(StatesGroup):
+    waiting_name = State()
+
+class UnbanState(StatesGroup):
+    waiting_name = State()
 
 # ------------------------------
 #   БАЗА ДАННЫХ
@@ -77,6 +90,18 @@ def create_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS questions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_tg_id INTEGER,
+                from_name TEXT,
+                question TEXT,
+                answered INTEGER DEFAULT 0,
+                created_at TEXT
+            )
+            """
+        )
 
 
 def get_user(tg_id: int):
@@ -97,8 +122,7 @@ def get_user(tg_id: int):
 
 
 def ensure_user(tg_id: int):
-    u = get_user(tg_id)
-    if u:
+    if get_user(tg_id):
         return
     with closing(db()) as conn, conn:
         conn.execute(
@@ -119,10 +143,7 @@ def set_banned(tg_id: int, value: bool):
 
 def set_notify(tg_id: int, value: bool):
     with closing(db()) as conn, conn:
-        conn.execute(
-            "UPDATE users SET notify_enabled=? WHERE tg_id=?",
-            (1 if value else 0, tg_id),
-        )
+        conn.execute("UPDATE users SET notify_enabled=? WHERE tg_id=?", (1 if value else 0, tg_id))
 
 
 def set_timezone(tg_id: int, tz: str):
@@ -136,15 +157,32 @@ def get_all_users():
             "SELECT tg_id, full_name, timezone, notify_enabled, banned FROM users"
         ).fetchall()
     return [
-        {
-            "tg_id": r[0],
-            "full_name": r[1],
-            "timezone": r[2],
-            "notify_enabled": bool(r[3]),
-            "banned": bool(r[4]),
-        }
+        {"tg_id": r[0], "full_name": r[1], "timezone": r[2],
+         "notify_enabled": bool(r[3]), "banned": bool(r[4])}
         for r in rows
     ]
+
+
+def save_question(from_tg_id: int, from_name: str, question: str) -> int:
+    with closing(db()) as conn, conn:
+        cur = conn.execute(
+            "INSERT INTO questions(from_tg_id, from_name, question, answered, created_at) VALUES(?,?,?,0,?)",
+            (from_tg_id, from_name, question, datetime.now().strftime("%d.%m.%Y %H:%M")),
+        )
+        return cur.lastrowid
+
+
+def get_unanswered_questions():
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT id, from_tg_id, from_name, question, created_at FROM questions WHERE answered=0 ORDER BY id"
+        ).fetchall()
+    return [{"id": r[0], "from_tg_id": r[1], "from_name": r[2], "question": r[3], "created_at": r[4]} for r in rows]
+
+
+def mark_answered(question_id: int):
+    with closing(db()) as conn, conn:
+        conn.execute("UPDATE questions SET answered=1 WHERE id=?", (question_id,))
 
 
 # ------------------------------
@@ -153,7 +191,6 @@ def get_all_users():
 
 PERSONAL = []
 ALL_NAMES = []
-
 WEEKDAY_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
@@ -178,8 +215,6 @@ def load_personal():
         logger.info("Loaded %s rows, %s unique names", len(PERSONAL), len(ALL_NAMES))
     except FileNotFoundError:
         logger.error("Schedule CSV %s not found", SCHEDULE_CSV)
-        PERSONAL = []
-        ALL_NAMES = []
 
 
 def get_lessons(full_name: str, d: date):
@@ -218,6 +253,7 @@ def main_menu(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📆 Неделя")],
         [KeyboardButton(text="🎮 Игры"), KeyboardButton(text="🎁 Сюрприз дня")],
         [KeyboardButton(text="☀️ До каникул"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="❓ Вопрос куратору")],
     ]
     if is_admin_user:
         kb.append([KeyboardButton(text="🛠 Админ-меню")])
@@ -261,9 +297,18 @@ def admin_menu() -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
         [KeyboardButton(text="👥 Список пользователей")],
+        [KeyboardButton(text="🚫 Заблокировать"), KeyboardButton(text="✅ Разблокировать")],
+        [KeyboardButton(text="💬 Вопросы учеников")],
         [KeyboardButton(text="⬅️ В главное меню")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+def cancel_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True,
+    )
 
 
 TIMEZONE_MAP = {
@@ -403,8 +448,12 @@ def surprise_for_today() -> str:
     return "🎁 <b>Сюрприз дня</b>\n" + SURPRISES[idx]
 
 
+# ==============================
+#   ХЕНДЛЕРЫ
+# ==============================
+
 # ------------------------------
-#   КОМАНДЫ
+#   СТАРТ
 # ------------------------------
 
 @dp.message(Command("start"))
@@ -435,7 +484,7 @@ async def cmd_myid(m: Message):
 
 
 # ------------------------------
-#   КНОПКИ ГЛАВНОГО МЕНЮ
+#   ГЛАВНОЕ МЕНЮ — КНОПКИ
 # ------------------------------
 
 @dp.message(F.text == "📅 Сегодня")
@@ -470,6 +519,22 @@ async def btn_surprise(m: Message):
     await m.answer(surprise_for_today())
 
 
+@dp.message(F.text == "⬅️ В главное меню")
+async def btn_back_to_main(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Главное меню 👇", reply_markup=main_menu(is_admin(m.from_user.id)))
+
+
+@dp.message(F.text == "❌ Отмена")
+async def btn_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    u = get_user(m.from_user.id)
+    if is_admin(m.from_user.id):
+        await m.answer("Отменено.", reply_markup=admin_menu())
+    else:
+        await m.answer("Отменено.", reply_markup=main_menu(is_admin(m.from_user.id)))
+
+
 # ------------------------------
 #   ПРОФИЛЬ
 # ------------------------------
@@ -477,9 +542,8 @@ async def btn_surprise(m: Message):
 @dp.message(F.text == "👤 Профиль")
 async def btn_profile(m: Message):
     u = get_user(m.from_user.id)
-    isadm = is_admin(m.from_user.id)
     if not u:
-        return await m.answer("Ты ещё не зарегистрирован.", reply_markup=main_menu(isadm))
+        return await m.answer("Ты ещё не зарегистрирован.", reply_markup=main_menu(is_admin(m.from_user.id)))
     txt = (
         f"👤 <b>Профиль</b>\n"
         f"ID: <code>{u['tg_id']}</code>\n"
@@ -529,6 +593,104 @@ async def btn_set_tz(m: Message):
 
 
 # ------------------------------
+#   ВОПРОС КУРАТОРУ
+# ------------------------------
+
+@dp.message(F.text == "❓ Вопрос куратору")
+async def btn_ask_question(m: Message, state: FSMContext):
+    u = get_user(m.from_user.id)
+    if not u or u["banned"]:
+        return await m.answer("🚫 Ты заблокирован.")
+    if not u["full_name"].strip():
+        return await m.answer("Сначала зарегистрируйся — напиши своё имя и фамилию.")
+    await state.set_state(QuestionState.waiting_question)
+    await m.answer(
+        "✏️ Напиши свой вопрос куратору.\nОн получит уведомление и ответит тебе прямо в боте.",
+        reply_markup=cancel_menu(),
+    )
+
+
+@dp.message(QuestionState.waiting_question)
+async def receive_question(m: Message, state: FSMContext):
+    await state.clear()
+    u = get_user(m.from_user.id)
+    if not u:
+        return
+
+    question_id = save_question(m.from_user.id, u["full_name"], m.text)
+
+    # Уведомляем обоих кураторов (они же админы)
+    for admin_id in ADMINS:
+        try:
+            inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="💬 Ответить",
+                    callback_data=f"answer_{question_id}_{m.from_user.id}"
+                )]
+            ])
+            await bot.send_message(
+                admin_id,
+                f"❓ <b>Новый вопрос куратору!</b>\n\n"
+                f"👤 От: <b>{u['full_name']}</b> (<code>{m.from_user.id}</code>)\n"
+                f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"💬 <b>Вопрос:</b>\n{m.text}",
+                reply_markup=inline_kb,
+            )
+        except Exception as e:
+            logger.warning("Failed to notify admin %s: %s", admin_id, e)
+
+    await m.answer(
+        "✅ Вопрос отправлен куратору! Ожидай ответа.",
+        reply_markup=main_menu(is_admin(m.from_user.id)),
+    )
+
+
+# Куратор нажал кнопку "Ответить" под вопросом
+@dp.callback_query(F.data.startswith("answer_"))
+async def callback_answer(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("❌ Нет прав.", show_alert=True)
+
+    parts = call.data.split("_")
+    question_id = int(parts[1])
+    student_id = int(parts[2])
+
+    await state.set_state(AnswerState.waiting_answer)
+    await state.update_data(question_id=question_id, student_id=student_id)
+
+    await call.message.answer(
+        f"✏️ Напиши ответ ученику (id: <code>{student_id}</code>).\nНажми «❌ Отмена» чтобы отменить.",
+        reply_markup=cancel_menu(),
+    )
+    await call.answer()
+
+
+# Куратор написал ответ
+@dp.message(AnswerState.waiting_answer)
+async def send_answer(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    question_id = data.get("question_id")
+    student_id = data.get("student_id")
+    await state.clear()
+
+    # Отправляем ответ ученику
+    try:
+        await bot.send_message(
+            student_id,
+            f"📩 <b>Ответ куратора на твой вопрос:</b>\n\n{m.text}",
+        )
+        mark_answered(question_id)
+        await m.answer("✅ Ответ отправлен ученику!", reply_markup=admin_menu())
+    except Exception as e:
+        logger.warning("Failed to send answer to student %s: %s", student_id, e)
+        await m.answer(f"❌ Не удалось отправить ответ. Ошибка: {e}", reply_markup=admin_menu())
+
+
+# ------------------------------
 #   ИГРЫ
 # ------------------------------
 
@@ -538,12 +700,6 @@ GUESS_GAME = {}
 @dp.message(F.text == "🎮 Игры")
 async def btn_games(m: Message):
     await m.answer("🎮 Выбирай игру 👇", reply_markup=games_menu())
-
-
-@dp.message(F.text == "⬅️ В главное меню")
-async def btn_back_to_main(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("Главное меню 👇", reply_markup=main_menu(is_admin(m.from_user.id)))
 
 
 @dp.message(F.text == "🎲 Кубик")
@@ -644,6 +800,7 @@ async def btn_admin_menu(m: Message):
     await m.answer("🛠 Админ-панель:", reply_markup=admin_menu())
 
 
+# --- Статистика ---
 @dp.message(F.text == "📊 Статистика")
 async def btn_stats(m: Message):
     if not is_admin(m.from_user.id):
@@ -654,17 +811,20 @@ async def btn_stats(m: Message):
     banned = sum(1 for u in users if u["banned"])
     no_name = sum(1 for u in users if not u["full_name"].strip())
     notify_on = sum(1 for u in users if u["notify_enabled"] and not u["banned"])
+    unanswered = len(get_unanswered_questions())
     txt = (
         f"📊 <b>Статистика бота</b>\n\n"
         f"👥 Всего пользователей: <b>{total}</b>\n"
         f"✅ Активных: <b>{active}</b>\n"
         f"🚫 Заблокированных: <b>{banned}</b>\n"
         f"❓ Без ФИО: <b>{no_name}</b>\n"
-        f"🔔 С уведомлениями: <b>{notify_on}</b>"
+        f"🔔 С уведомлениями: <b>{notify_on}</b>\n"
+        f"💬 Неотвеченных вопросов: <b>{unanswered}</b>"
     )
     await m.answer(txt, reply_markup=admin_menu())
 
 
+# --- Список пользователей ---
 @dp.message(F.text == "👥 Список пользователей")
 async def btn_users_list(m: Message):
     if not is_admin(m.from_user.id):
@@ -680,26 +840,119 @@ async def btn_users_list(m: Message):
     await m.answer("\n".join(lines), reply_markup=admin_menu())
 
 
+# --- Вопросы учеников ---
+@dp.message(F.text == "💬 Вопросы учеников")
+async def btn_questions_list(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    questions = get_unanswered_questions()
+    if not questions:
+        return await m.answer("✅ Нет неотвеченных вопросов!", reply_markup=admin_menu())
+
+    await m.answer(f"💬 <b>Неотвеченных вопросов: {len(questions)}</b>", reply_markup=admin_menu())
+
+    for q in questions:
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="💬 Ответить",
+                callback_data=f"answer_{q['id']}_{q['from_tg_id']}"
+            )]
+        ])
+        await m.answer(
+            f"👤 <b>{q['from_name']}</b> (<code>{q['from_tg_id']}</code>)\n"
+            f"🕐 {q['created_at']}\n\n"
+            f"💬 {q['question']}",
+            reply_markup=inline_kb,
+        )
+
+
+# --- Заблокировать через кнопку ---
+@dp.message(F.text == "🚫 Заблокировать")
+async def btn_ban_start(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    users = get_all_users()
+    active_users = [u for u in users if not u["banned"] and u["full_name"].strip()]
+    if not active_users:
+        return await m.answer("Нет активных пользователей.", reply_markup=admin_menu())
+
+    await state.set_state(BanState.waiting_name)
+
+    # Показываем кнопки с именами активных пользователей
+    kb_buttons = [[KeyboardButton(text=u["full_name"])] for u in active_users]
+    kb_buttons.append([KeyboardButton(text="❌ Отмена")])
+    kb = ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True)
+    await m.answer("Выбери кого заблокировать:", reply_markup=kb)
+
+
+@dp.message(BanState.waiting_name)
+async def btn_ban_confirm(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    name = m.text.strip()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT tg_id, full_name FROM users WHERE lower(full_name)=lower(?)", (name,)
+        ).fetchall()
+    if not rows:
+        await state.clear()
+        return await m.answer(f"Пользователь «{name}» не найден.", reply_markup=admin_menu())
+    tg_id, full_name = rows[0]
+    set_banned(tg_id, True)
+    schedule_all_morning()
+    await state.clear()
+    await m.answer(f"🚫 <b>{full_name}</b> заблокирован.", reply_markup=admin_menu())
+
+
+# --- Разблокировать через кнопку ---
+@dp.message(F.text == "✅ Разблокировать")
+async def btn_unban_start(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    users = get_all_users()
+    banned_users = [u for u in users if u["banned"]]
+    if not banned_users:
+        return await m.answer("Нет заблокированных пользователей.", reply_markup=admin_menu())
+
+    await state.set_state(UnbanState.waiting_name)
+
+    kb_buttons = [[KeyboardButton(text=u["full_name"])] for u in banned_users]
+    kb_buttons.append([KeyboardButton(text="❌ Отмена")])
+    kb = ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True)
+    await m.answer("Выбери кого разблокировать:", reply_markup=kb)
+
+
+@dp.message(UnbanState.waiting_name)
+async def btn_unban_confirm(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    name = m.text.strip()
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT tg_id, full_name FROM users WHERE lower(full_name)=lower(?)", (name,)
+        ).fetchall()
+    if not rows:
+        await state.clear()
+        return await m.answer(f"Пользователь «{name}» не найден.", reply_markup=admin_menu())
+    tg_id, full_name = rows[0]
+    set_banned(tg_id, False)
+    schedule_all_morning()
+    await state.clear()
+    await m.answer(f"✅ <b>{full_name}</b> разблокирован.", reply_markup=admin_menu())
+
+
+# --- Рассылка ---
 @dp.message(F.text == "📢 Рассылка")
 async def btn_broadcast_start(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ Нет прав.")
     await state.set_state(BroadcastState.waiting_message)
-    cancel_kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена рассылки")]],
-        resize_keyboard=True,
-    )
     await m.answer(
-        "✏️ Напиши сообщение для рассылки всем пользователям.\n"
-        "Нажми «❌ Отмена рассылки» чтобы отменить.",
-        reply_markup=cancel_kb,
+        "✏️ Напиши сообщение для рассылки всем пользователям.",
+        reply_markup=cancel_menu(),
     )
-
-
-@dp.message(F.text == "❌ Отмена рассылки")
-async def btn_broadcast_cancel(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("Рассылка отменена.", reply_markup=admin_menu())
 
 
 @dp.message(BroadcastState.waiting_message)
@@ -726,46 +979,6 @@ async def btn_broadcast_send(m: Message, state: FSMContext):
         f"✅ Рассылка завершена!\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>",
         reply_markup=admin_menu(),
     )
-
-
-@dp.message(Command("ban"))
-async def cmd_ban(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ Нет прав.")
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await m.answer("Использование: /ban Фамилия Имя")
-    name = parts[1].strip()
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)", (name,)
-        ).fetchall()
-    if not rows:
-        return await m.answer(f"Пользователь «{name}» не найден.")
-    tg_id, full_name, _ = rows[0]
-    set_banned(tg_id, True)
-    schedule_all_morning()
-    await m.answer(f"🚫 <b>{full_name}</b> заблокирован.")
-
-
-@dp.message(Command("unban"))
-async def cmd_unban(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("❌ Нет прав.")
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await m.answer("Использование: /unban Фамилия Имя")
-    name = parts[1].strip()
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT tg_id, full_name, banned FROM users WHERE lower(full_name)=lower(?)", (name,)
-        ).fetchall()
-    if not rows:
-        return await m.answer(f"Пользователь «{name}» не найден.")
-    tg_id, full_name, _ = rows[0]
-    set_banned(tg_id, False)
-    schedule_all_morning()
-    await m.answer(f"✅ <b>{full_name}</b> разблокирован.")
 
 
 # ------------------------------
