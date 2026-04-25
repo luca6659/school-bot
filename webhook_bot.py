@@ -32,7 +32,7 @@ from apscheduler.triggers.cron import CronTrigger
 BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН_БОТА")
 
 # ключ Gemini — вставь свой новый ключ сюда
-OPENAI_API_KEY = "sk-ls1Hbu836M3SJATdmMXwkA"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ")
 
 # Лимит вопросов к ИИ в день на одного пользователя
 AI_DAILY_LIMIT = 10
@@ -299,8 +299,8 @@ async def ask_gemini(question: str) -> str:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    print("GEMINI ERROR:", resp.status, error_text)
-                    return f"❌ Ошибка ИИ:\n{resp.status}\n{error_text}"
+                    logger.error("Gemini error %s: %s", resp.status, error_text)
+                    return "❌ Ошибка при обращении к ИИ. Попробуй позже."
                 data = await resp.json()
                 answer = data["candidates"][0]["content"]["parts"][0]["text"]
                 return answer
