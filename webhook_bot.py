@@ -299,8 +299,8 @@ async def ask_gemini(question: str) -> str:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    logger.error("Gemini error %s: %s", resp.status, error_text)
-                    return "❌ Ошибка при обращении к ИИ. Попробуй позже."
+                    print("GEMINI ERROR:", resp.status, error_text)
+                    return f"❌ Ошибка ИИ:\n{resp.status}\n{error_text}"
                 data = await resp.json()
                 answer = data["candidates"][0]["content"]["parts"][0]["text"]
                 return answer
