@@ -8,9 +8,14 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 import os
 
+import aiohttp
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
@@ -24,7 +29,13 @@ from apscheduler.triggers.cron import CronTrigger
 #   НАСТРОЙКИ БОТА
 # ------------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7977975083:AAFKM15DQm3ov2rvSklus2Ju24mlaz001SI")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН_БОТА")
+
+# ключ Gemini — вставь свой новый ключ сюда
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ")
+
+# Лимит вопросов к ИИ в день на одного пользователя
+AI_DAILY_LIMIT = 10
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -34,11 +45,11 @@ SCHEDULE_CSV = "personal_schedule_all.csv"
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Оба администратора — они же кураторы
 ADMINS = {7454117594, 5729574721}
-
-# Последний день учёбы перед летними каникулами
 SUMMER_START = date(2026, 5, 25)
+
+MAINTENANCE_MODE = False
+MAINTENANCE_TEXT = "🔧 Ведутся технические работы. Бот временно недоступен. Попробуй позже!"
 
 # ------------------------------
 #   ЛОГИ
@@ -66,6 +77,12 @@ class BanState(StatesGroup):
 class UnbanState(StatesGroup):
     waiting_name = State()
 
+class AiState(StatesGroup):
+    waiting_question = State()
+
+class SetGeminiKeyState(StatesGroup):
+    waiting_key = State()
+
 # ------------------------------
 #   БАЗА ДАННЫХ
 # ------------------------------
@@ -79,8 +96,7 @@ def db():
 
 def create_db():
     with closing(db()) as conn, conn:
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users(
                 tg_id INTEGER PRIMARY KEY,
                 full_name TEXT DEFAULT '',
@@ -88,10 +104,8 @@ def create_db():
                 notify_enabled INTEGER DEFAULT 1,
                 banned INTEGER DEFAULT 0
             )
-            """
-        )
-        conn.execute(
-            """
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS questions(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_tg_id INTEGER,
@@ -100,8 +114,20 @@ def create_db():
                 answered INTEGER DEFAULT 0,
                 created_at TEXT
             )
-            """
-        )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_usage(
+                tg_id INTEGER PRIMARY KEY,
+                count INTEGER DEFAULT 0,
+                last_date TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT DEFAULT ''
+            )
+        """)
 
 
 def get_user(tg_id: int):
@@ -113,11 +139,8 @@ def get_user(tg_id: int):
     if not row:
         return None
     return {
-        "tg_id": row[0],
-        "full_name": row[1],
-        "timezone": row[2],
-        "notify_enabled": bool(row[3]),
-        "banned": bool(row[4]),
+        "tg_id": row[0], "full_name": row[1], "timezone": row[2],
+        "notify_enabled": bool(row[3]), "banned": bool(row[4]),
     }
 
 
@@ -183,6 +206,109 @@ def get_unanswered_questions():
 def mark_answered(question_id: int):
     with closing(db()) as conn, conn:
         conn.execute("UPDATE questions SET answered=1 WHERE id=?", (question_id,))
+
+
+# --- AI лимиты ---
+
+def get_ai_usage(tg_id: int) -> int:
+    today = date.today().isoformat()
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT count, last_date FROM ai_usage WHERE tg_id=?", (tg_id,)
+        ).fetchone()
+    if not row:
+        return 0
+    count, last_date = row
+    if last_date != today:
+        return 0  # новый день — счётчик обнулился
+    return count
+
+
+def increment_ai_usage(tg_id: int):
+    today = date.today().isoformat()
+    with closing(db()) as conn, conn:
+        row = conn.execute(
+            "SELECT count, last_date FROM ai_usage WHERE tg_id=?", (tg_id,)
+        ).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO ai_usage(tg_id, count, last_date) VALUES(?,1,?)", (tg_id, today)
+            )
+        elif row[1] != today:
+            conn.execute(
+                "UPDATE ai_usage SET count=1, last_date=? WHERE tg_id=?", (today, tg_id)
+            )
+        else:
+            conn.execute(
+                "UPDATE ai_usage SET count=count+1 WHERE tg_id=?", (tg_id,)
+            )
+
+
+# --- Настройки (Gemini ключ) ---
+
+def get_setting(key: str) -> str:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else ""
+
+
+def set_setting(key: str, value: str):
+    with closing(db()) as conn, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES(?,?)", (key, value)
+        )
+
+
+def get_gemini_key() -> str:
+    # Сначала из базы, потом из кода
+    db_key = get_setting("gemini_key")
+    if db_key:
+        return db_key
+    return GEMINI_API_KEY
+
+
+# ------------------------------
+#   GEMINI API
+# ------------------------------
+
+async def ask_gemini(question: str) -> str:
+    api_key = get_gemini_key()
+    if not api_key or api_key == "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ":
+        return "❌ ИИ-помощник не настроен. Обратись к администратору."
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": (
+                            "Ты умный школьный помощник. Отвечай на русском языке. "
+                            "Давай чёткие, понятные ответы для школьников.\n\n"
+                            f"Вопрос: {question}"
+                        )
+                    }
+                ]
+            }
+        ]
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error("Gemini error %s: %s", resp.status, error_text)
+                    return "❌ Ошибка при обращении к ИИ. Попробуй позже."
+                data = await resp.json()
+                answer = data["candidates"][0]["content"]["parts"][0]["text"]
+                return answer
+    except asyncio.TimeoutError:
+        return "⏱ ИИ не ответил вовремя. Попробуй ещё раз."
+    except Exception as e:
+        logger.error("Gemini exception: %s", e)
+        return "❌ Произошла ошибка. Попробуй позже."
 
 
 # ------------------------------
@@ -253,7 +379,7 @@ def main_menu(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📆 Неделя")],
         [KeyboardButton(text="🎮 Игры"), KeyboardButton(text="🎁 Сюрприз дня")],
         [KeyboardButton(text="☀️ До каникул"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="❓ Вопрос куратору")],
+        [KeyboardButton(text="❓ Вопрос куратору"), KeyboardButton(text="🤖 ИИ-помощник")],
     ]
     if is_admin_user:
         kb.append([KeyboardButton(text="🛠 Админ-меню")])
@@ -294,11 +420,14 @@ def timezone_menu() -> ReplyKeyboardMarkup:
 
 
 def admin_menu() -> ReplyKeyboardMarkup:
+    maintenance_btn = "✅ Выкл. тех. работы" if MAINTENANCE_MODE else "🔧 Вкл. тех. работы"
     kb = [
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
         [KeyboardButton(text="👥 Список пользователей")],
         [KeyboardButton(text="🚫 Заблокировать"), KeyboardButton(text="✅ Разблокировать")],
         [KeyboardButton(text="💬 Вопросы учеников")],
+        [KeyboardButton(text="🔑 Установить AI ключ")],
+        [KeyboardButton(text=maintenance_btn)],
         [KeyboardButton(text="⬅️ В главное меню")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
@@ -309,6 +438,13 @@ def cancel_menu() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True,
     )
+
+
+def ai_menu() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="⬅️ В главное меню")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
 TIMEZONE_MAP = {
@@ -449,12 +585,26 @@ def surprise_for_today() -> str:
 
 
 # ==============================
-#   ХЕНДЛЕРЫ
+#   MIDDLEWARE — ТЕХ. РАБОТЫ
 # ==============================
 
-# ------------------------------
-#   СТАРТ
-# ------------------------------
+@dp.message.outer_middleware()
+async def maintenance_middleware(handler, event: Message, data: dict):
+    global MAINTENANCE_MODE
+    if is_admin(event.from_user.id):
+        return await handler(event, data)
+    if event.text and event.text.startswith("/start"):
+        if MAINTENANCE_MODE:
+            return await event.answer(MAINTENANCE_TEXT)
+        return await handler(event, data)
+    if MAINTENANCE_MODE:
+        return await event.answer(MAINTENANCE_TEXT)
+    return await handler(event, data)
+
+
+# ==============================
+#   ХЕНДЛЕРЫ
+# ==============================
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message, state: FSMContext):
@@ -484,7 +634,7 @@ async def cmd_myid(m: Message):
 
 
 # ------------------------------
-#   ГЛАВНОЕ МЕНЮ — КНОПКИ
+#   ГЛАВНОЕ МЕНЮ
 # ------------------------------
 
 @dp.message(F.text == "📅 Сегодня")
@@ -528,7 +678,6 @@ async def btn_back_to_main(m: Message, state: FSMContext):
 @dp.message(F.text == "❌ Отмена")
 async def btn_cancel(m: Message, state: FSMContext):
     await state.clear()
-    u = get_user(m.from_user.id)
     if is_admin(m.from_user.id):
         await m.answer("Отменено.", reply_markup=admin_menu())
     else:
@@ -593,6 +742,76 @@ async def btn_set_tz(m: Message):
 
 
 # ------------------------------
+#   🤖 ИИ-ПОМОЩНИК
+# ------------------------------
+
+@dp.message(F.text == "🤖 ИИ-помощник")
+async def btn_ai(m: Message, state: FSMContext):
+    u = get_user(m.from_user.id)
+    if not u or u["banned"]:
+        return await m.answer("🚫 Ты заблокирован.")
+    if not u["full_name"].strip():
+        return await m.answer("Сначала зарегистрируйся.")
+
+    used = get_ai_usage(m.from_user.id)
+    remaining = AI_DAILY_LIMIT - used
+
+    if remaining <= 0:
+        return await m.answer(
+            f"😔 Ты исчерпал дневной лимит <b>{AI_DAILY_LIMIT} вопросов</b>.\n"
+            f"Приходи завтра — лимит обновится в полночь! 🌙",
+            reply_markup=main_menu(is_admin(m.from_user.id)),
+        )
+
+    await state.set_state(AiState.waiting_question)
+    await m.answer(
+        f"🤖 <b>ИИ-помощник</b>\n\n"
+        f"Задай любой вопрос — я постараюсь помочь!\n"
+        f"📊 Осталось вопросов сегодня: <b>{remaining}/{AI_DAILY_LIMIT}</b>\n\n"
+        f"Напиши свой вопрос 👇",
+        reply_markup=cancel_menu(),
+    )
+
+
+@dp.message(AiState.waiting_question)
+async def handle_ai_question(m: Message, state: FSMContext):
+    await state.clear()
+    u = get_user(m.from_user.id)
+    if not u or u["banned"]:
+        return
+
+    used = get_ai_usage(m.from_user.id)
+    if used >= AI_DAILY_LIMIT:
+        return await m.answer(
+            f"😔 Лимит исчерпан. Приходи завтра!",
+            reply_markup=main_menu(is_admin(m.from_user.id)),
+        )
+
+    # Показываем что думаем
+    thinking_msg = await m.answer("🤖 Думаю над ответом...")
+
+    # Запрос к Gemini
+    answer = await ask_gemini(m.text)
+
+    # Увеличиваем счётчик
+    increment_ai_usage(m.from_user.id)
+    used_now = get_ai_usage(m.from_user.id)
+    remaining = AI_DAILY_LIMIT - used_now
+
+    # Удаляем сообщение "думаю"
+    try:
+        await thinking_msg.delete()
+    except Exception:
+        pass
+
+    await m.answer(
+        f"🤖 <b>Ответ ИИ:</b>\n\n{answer}\n\n"
+        f"📊 Осталось вопросов сегодня: <b>{remaining}/{AI_DAILY_LIMIT}</b>",
+        reply_markup=main_menu(is_admin(m.from_user.id)),
+    )
+
+
+# ------------------------------
 #   ВОПРОС КУРАТОРУ
 # ------------------------------
 
@@ -602,7 +821,7 @@ async def btn_ask_question(m: Message, state: FSMContext):
     if not u or u["banned"]:
         return await m.answer("🚫 Ты заблокирован.")
     if not u["full_name"].strip():
-        return await m.answer("Сначала зарегистрируйся — напиши своё имя и фамилию.")
+        return await m.answer("Сначала зарегистрируйся.")
     await state.set_state(QuestionState.waiting_question)
     await m.answer(
         "✏️ Напиши свой вопрос куратору.\nОн получит уведомление и ответит тебе прямо в боте.",
@@ -616,10 +835,7 @@ async def receive_question(m: Message, state: FSMContext):
     u = get_user(m.from_user.id)
     if not u:
         return
-
     question_id = save_question(m.from_user.id, u["full_name"], m.text)
-
-    # Уведомляем обоих кураторов (они же админы)
     for admin_id in ADMINS:
         try:
             inline_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -638,46 +854,37 @@ async def receive_question(m: Message, state: FSMContext):
             )
         except Exception as e:
             logger.warning("Failed to notify admin %s: %s", admin_id, e)
-
     await m.answer(
         "✅ Вопрос отправлен куратору! Ожидай ответа.",
         reply_markup=main_menu(is_admin(m.from_user.id)),
     )
 
 
-# Куратор нажал кнопку "Ответить" под вопросом
 @dp.callback_query(F.data.startswith("answer_"))
 async def callback_answer(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return await call.answer("❌ Нет прав.", show_alert=True)
-
     parts = call.data.split("_")
     question_id = int(parts[1])
     student_id = int(parts[2])
-
     await state.set_state(AnswerState.waiting_answer)
     await state.update_data(question_id=question_id, student_id=student_id)
-
     await call.message.answer(
-        f"✏️ Напиши ответ ученику (id: <code>{student_id}</code>).\nНажми «❌ Отмена» чтобы отменить.",
+        f"✏️ Напиши ответ ученику (id: <code>{student_id}</code>).",
         reply_markup=cancel_menu(),
     )
     await call.answer()
 
 
-# Куратор написал ответ
 @dp.message(AnswerState.waiting_answer)
 async def send_answer(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         await state.clear()
         return
-
     data = await state.get_data()
     question_id = data.get("question_id")
     student_id = data.get("student_id")
     await state.clear()
-
-    # Отправляем ответ ученику
     try:
         await bot.send_message(
             student_id,
@@ -686,7 +893,6 @@ async def send_answer(m: Message, state: FSMContext):
         mark_answered(question_id)
         await m.answer("✅ Ответ отправлен ученику!", reply_markup=admin_menu())
     except Exception as e:
-        logger.warning("Failed to send answer to student %s: %s", student_id, e)
         await m.answer(f"❌ Не удалось отправить ответ. Ошибка: {e}", reply_markup=admin_menu())
 
 
@@ -797,7 +1003,80 @@ async def game_rps(m: Message):
 async def btn_admin_menu(m: Message):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ Нет прав.")
-    await m.answer("🛠 Админ-панель:", reply_markup=admin_menu())
+    status = "🔧 ТЕХ. РАБОТЫ ВКЛЮЧЕНЫ" if MAINTENANCE_MODE else "✅ Бот работает в штатном режиме"
+    await m.answer(f"🛠 Админ-панель\n{status}", reply_markup=admin_menu())
+
+
+# --- Установить AI ключ ---
+@dp.message(F.text == "🔑 Установить AI ключ")
+async def btn_set_ai_key(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    current = get_gemini_key()
+    masked = current[:8] + "..." if current and current != "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ" else "не установлен"
+    await state.set_state(SetGeminiKeyState.waiting_key)
+    await m.answer(
+        f"🔑 <b>Установка Gemini API ключа</b>\n\n"
+        f"Текущий ключ: <code>{masked}</code>\n\n"
+        f"Введи новый ключ (начинается с AIza...):",
+        reply_markup=cancel_menu(),
+    )
+
+
+@dp.message(SetGeminiKeyState.waiting_key)
+async def receive_gemini_key(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    key = m.text.strip()
+    if not key.startswith("AIza"):
+        return await m.answer("❌ Ключ должен начинаться с 'AIza...'. Попробуй ещё раз.")
+    set_setting("gemini_key", key)
+    await state.clear()
+    await m.answer(
+        f"✅ Gemini API ключ успешно обновлён!\n<code>{key[:8]}...</code>",
+        reply_markup=admin_menu(),
+    )
+
+
+# --- Тех. работы ---
+@dp.message(F.text.in_({"🔧 Вкл. тех. работы", "✅ Выкл. тех. работы"}))
+async def btn_toggle_maintenance(m: Message):
+    global MAINTENANCE_MODE
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Нет прав.")
+    MAINTENANCE_MODE = not MAINTENANCE_MODE
+    users = get_all_users()
+    if MAINTENANCE_MODE:
+        for u in users:
+            if u["banned"] or u["tg_id"] in ADMINS:
+                continue
+            try:
+                await bot.send_message(u["tg_id"], MAINTENANCE_TEXT)
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        await m.answer(
+            "🔧 <b>Технические работы включены!</b>\nВсе пользователи уведомлены.",
+            reply_markup=admin_menu(),
+        )
+    else:
+        for u in users:
+            if u["banned"] or u["tg_id"] in ADMINS:
+                continue
+            try:
+                await bot.send_message(
+                    u["tg_id"],
+                    "✅ <b>Технические работы завершены!</b>\nБот снова работает!",
+                    reply_markup=main_menu(False),
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        await m.answer(
+            "✅ <b>Технические работы выключены!</b>",
+            reply_markup=admin_menu(),
+        )
 
 
 # --- Статистика ---
@@ -812,6 +1091,9 @@ async def btn_stats(m: Message):
     no_name = sum(1 for u in users if not u["full_name"].strip())
     notify_on = sum(1 for u in users if u["notify_enabled"] and not u["banned"])
     unanswered = len(get_unanswered_questions())
+    maintenance = "🔧 Включены" if MAINTENANCE_MODE else "✅ Выключены"
+    ai_key = get_gemini_key()
+    ai_status = "✅ Установлен" if ai_key and ai_key != "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ" else "❌ Не установлен"
     txt = (
         f"📊 <b>Статистика бота</b>\n\n"
         f"👥 Всего пользователей: <b>{total}</b>\n"
@@ -819,7 +1101,9 @@ async def btn_stats(m: Message):
         f"🚫 Заблокированных: <b>{banned}</b>\n"
         f"❓ Без ФИО: <b>{no_name}</b>\n"
         f"🔔 С уведомлениями: <b>{notify_on}</b>\n"
-        f"💬 Неотвеченных вопросов: <b>{unanswered}</b>"
+        f"💬 Неотвеченных вопросов: <b>{unanswered}</b>\n"
+        f"🔧 Тех. работы: <b>{maintenance}</b>\n"
+        f"🤖 AI ключ: <b>{ai_status}</b>"
     )
     await m.answer(txt, reply_markup=admin_menu())
 
@@ -848,9 +1132,7 @@ async def btn_questions_list(m: Message):
     questions = get_unanswered_questions()
     if not questions:
         return await m.answer("✅ Нет неотвеченных вопросов!", reply_markup=admin_menu())
-
-    await m.answer(f"💬 <b>Неотвеченных вопросов: {len(questions)}</b>", reply_markup=admin_menu())
-
+    await m.answer(f"💬 <b>Неотвеченных: {len(questions)}</b>", reply_markup=admin_menu())
     for q in questions:
         inline_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
@@ -860,29 +1142,24 @@ async def btn_questions_list(m: Message):
         ])
         await m.answer(
             f"👤 <b>{q['from_name']}</b> (<code>{q['from_tg_id']}</code>)\n"
-            f"🕐 {q['created_at']}\n\n"
-            f"💬 {q['question']}",
+            f"🕐 {q['created_at']}\n\n💬 {q['question']}",
             reply_markup=inline_kb,
         )
 
 
-# --- Заблокировать через кнопку ---
+# --- Заблокировать ---
 @dp.message(F.text == "🚫 Заблокировать")
 async def btn_ban_start(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ Нет прав.")
     users = get_all_users()
-    active_users = [u for u in users if not u["banned"] and u["full_name"].strip()]
+    active_users = [u for u in users if not u["banned"] and u["full_name"].strip() and u["tg_id"] not in ADMINS]
     if not active_users:
         return await m.answer("Нет активных пользователей.", reply_markup=admin_menu())
-
     await state.set_state(BanState.waiting_name)
-
-    # Показываем кнопки с именами активных пользователей
     kb_buttons = [[KeyboardButton(text=u["full_name"])] for u in active_users]
     kb_buttons.append([KeyboardButton(text="❌ Отмена")])
-    kb = ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True)
-    await m.answer("Выбери кого заблокировать:", reply_markup=kb)
+    await m.answer("Выбери кого заблокировать:", reply_markup=ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True))
 
 
 @dp.message(BanState.waiting_name)
@@ -905,7 +1182,7 @@ async def btn_ban_confirm(m: Message, state: FSMContext):
     await m.answer(f"🚫 <b>{full_name}</b> заблокирован.", reply_markup=admin_menu())
 
 
-# --- Разблокировать через кнопку ---
+# --- Разблокировать ---
 @dp.message(F.text == "✅ Разблокировать")
 async def btn_unban_start(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
@@ -914,13 +1191,10 @@ async def btn_unban_start(m: Message, state: FSMContext):
     banned_users = [u for u in users if u["banned"]]
     if not banned_users:
         return await m.answer("Нет заблокированных пользователей.", reply_markup=admin_menu())
-
     await state.set_state(UnbanState.waiting_name)
-
     kb_buttons = [[KeyboardButton(text=u["full_name"])] for u in banned_users]
     kb_buttons.append([KeyboardButton(text="❌ Отмена")])
-    kb = ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True)
-    await m.answer("Выбери кого разблокировать:", reply_markup=kb)
+    await m.answer("Выбери кого разблокировать:", reply_markup=ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True))
 
 
 @dp.message(UnbanState.waiting_name)
@@ -949,10 +1223,7 @@ async def btn_broadcast_start(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ Нет прав.")
     await state.set_state(BroadcastState.waiting_message)
-    await m.answer(
-        "✏️ Напиши сообщение для рассылки всем пользователям.",
-        reply_markup=cancel_menu(),
-    )
+    await m.answer("✏️ Напиши сообщение для рассылки.", reply_markup=cancel_menu())
 
 
 @dp.message(BroadcastState.waiting_message)
@@ -971,8 +1242,7 @@ async def btn_broadcast_send(m: Message, state: FSMContext):
         try:
             await bot.send_message(u["tg_id"], text)
             sent += 1
-        except Exception as e:
-            logger.warning("Broadcast failed for %s: %s", u["tg_id"], e)
+        except Exception:
             failed += 1
         await asyncio.sleep(0.05)
     await m.answer(
@@ -989,28 +1259,20 @@ async def btn_broadcast_send(m: Message, state: FSMContext):
 async def handle_text(m: Message):
     ensure_user(m.from_user.id)
     u = get_user(m.from_user.id)
-
     if u["banned"]:
         return await m.answer("🚫 Ты заблокирован.")
-
     if not u["full_name"].strip():
         name = m.text.strip()
         if ALL_NAMES and name.lower() not in [n.lower() for n in ALL_NAMES]:
             sample = "\n".join(f"• {n}" for n in ALL_NAMES[:6])
-            return await m.answer(
-                f"❌ «{name}» не найден в расписании.\n\nПримеры:\n{sample}"
-            )
+            return await m.answer(f"❌ «{name}» не найден в расписании.\n\nПримеры:\n{sample}")
         set_full_name(m.from_user.id, name)
         schedule_all_morning()
         return await m.answer(
             f"✅ Привет, <b>{name}</b>! Ты зарегистрирован.",
             reply_markup=main_menu(is_admin(m.from_user.id)),
         )
-
-    await m.answer(
-        "Используй кнопки меню 👇",
-        reply_markup=main_menu(is_admin(m.from_user.id)),
-    )
+    await m.answer("Используй кнопки меню 👇", reply_markup=main_menu(is_admin(m.from_user.id)))
 
 
 # ------------------------------
