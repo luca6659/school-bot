@@ -32,7 +32,7 @@ from apscheduler.triggers.cron import CronTrigger
 BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН_БОТА")
 
 # ключ Gemini — вставь свой новый ключ сюда
-GEMINI_API_KEY = "AIzaSyAB6tV1AWG5sVHjWzUvrep9NzoKieagjSg"
+OPENAI_API_KEY = "sk-ls1Hbu836M3SJATdmMXwkA"
 
 # Лимит вопросов к ИИ в день на одного пользователя
 AI_DAILY_LIMIT = 10
