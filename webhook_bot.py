@@ -29,16 +29,16 @@ from apscheduler.triggers.cron import CronTrigger
 #   НАСТРОЙКИ БОТА
 # ------------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ТОКЕН_БОТА")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7977975083:AAFKM15DQm3ov2rvSklus2Ju24mlaz001SI")
 
-# ключ Gemini — вставь свой новый ключ сюда
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ")
+# ↓↓↓ ВСТАВЬ СЮДА СВОЙ НОВЫЙ CLAUDE КЛЮЧ ↓↓↓
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "sk-ant-api01-d5tuwaDmDsm4YGSh0dp4MCkqnYUZKtc8FKCJuI3OCEUXk5zNaBLUGfatcsD5xhjk")
+# ↑↑↑ ВСТАВЬ СЮДА СВОЙ НОВЫЙ CLAUDE КЛЮЧ ↑↑↑
 
-# Лимит вопросов к ИИ в день на одного пользователя
+CLAUDE_BASE_URL = "https://api.stepanovikov.uno"
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
 AI_DAILY_LIMIT = 10
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
 
 DEFAULT_TZ = "Europe/Moscow"
 SCHEDULE_CSV = "personal_schedule_all.csv"
@@ -80,7 +80,7 @@ class UnbanState(StatesGroup):
 class AiState(StatesGroup):
     waiting_question = State()
 
-class SetGeminiKeyState(StatesGroup):
+class SetClaudeKeyState(StatesGroup):
     waiting_key = State()
 
 # ------------------------------
@@ -208,8 +208,6 @@ def mark_answered(question_id: int):
         conn.execute("UPDATE questions SET answered=1 WHERE id=?", (question_id,))
 
 
-# --- AI лимиты ---
-
 def get_ai_usage(tg_id: int) -> int:
     today = date.today().isoformat()
     with closing(db()) as conn:
@@ -220,7 +218,7 @@ def get_ai_usage(tg_id: int) -> int:
         return 0
     count, last_date = row
     if last_date != today:
-        return 0  # новый день — счётчик обнулился
+        return 0
     return count
 
 
@@ -244,8 +242,6 @@ def increment_ai_usage(tg_id: int):
             )
 
 
-# --- Настройки (Gemini ключ) ---
-
 def get_setting(key: str) -> str:
     with closing(db()) as conn:
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -259,55 +255,65 @@ def set_setting(key: str, value: str):
         )
 
 
-def get_gemini_key() -> str:
-    # Сначала из базы, потом из кода
-    db_key = get_setting("gemini_key")
+def get_claude_key() -> str:
+    db_key = get_setting("claude_key")
     if db_key:
         return db_key
-    return GEMINI_API_KEY
+    return CLAUDE_API_KEY
 
 
 # ------------------------------
-#   GEMINI API
+#   CLAUDE API
 # ------------------------------
 
-async def ask_gemini(question: str) -> str:
-    api_key = get_gemini_key()
-    if not api_key or api_key == "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ":
+async def ask_claude(question: str) -> str:
+    api_key = get_claude_key()
+    if not api_key or api_key == "СЮДА_СВОЙ_CLAUDE_КЛЮЧ":
         return "❌ ИИ-помощник не настроен. Обратись к администратору."
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    url = f"{CLAUDE_BASE_URL}/v1/messages"
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
 
     payload = {
-        "contents": [
+        "model": CLAUDE_MODEL,
+        "max_tokens": 1024,
+        "messages": [
             {
-                "parts": [
-                    {
-                        "text": (
-                            "Ты умный школьный помощник. Отвечай на русском языке. "
-                            "Давай чёткие, понятные ответы для школьников.\n\n"
-                            f"Вопрос: {question}"
-                        )
-                    }
-                ]
+                "role": "user",
+                "content": (
+                    "Ты умный школьный помощник. Отвечай на русском языке. "
+                    "Давай чёткие, понятные ответы для школьников. "
+                    "Отвечай кратко и по делу.\n\n"
+                    f"Вопрос: {question}"
+                )
             }
         ]
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    logger.error("Gemini error %s: %s", resp.status, error_text)
+                    logger.error("Claude error %s: %s", resp.status, error_text)
                     return "❌ Ошибка при обращении к ИИ. Попробуй позже."
                 data = await resp.json()
-                answer = data["candidates"][0]["content"]["parts"][0]["text"]
+                answer = data["content"][0]["text"]
                 return answer
     except asyncio.TimeoutError:
         return "⏱ ИИ не ответил вовремя. Попробуй ещё раз."
     except Exception as e:
-        logger.error("Gemini exception: %s", e)
+        logger.error("Claude exception: %s", e)
         return "❌ Произошла ошибка. Попробуй позже."
 
 
@@ -438,13 +444,6 @@ def cancel_menu() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True,
     )
-
-
-def ai_menu() -> ReplyKeyboardMarkup:
-    kb = [
-        [KeyboardButton(text="⬅️ В главное меню")],
-    ]
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
 TIMEZONE_MAP = {
@@ -742,7 +741,7 @@ async def btn_set_tz(m: Message):
 
 
 # ------------------------------
-#   🤖 ИИ-ПОМОЩНИК
+#   🤖 ИИ-ПОМОЩНИК (Claude)
 # ------------------------------
 
 @dp.message(F.text == "🤖 ИИ-помощник")
@@ -765,7 +764,7 @@ async def btn_ai(m: Message, state: FSMContext):
 
     await state.set_state(AiState.waiting_question)
     await m.answer(
-        f"🤖 <b>ИИ-помощник</b>\n\n"
+        f"🤖 <b>ИИ-помощник (Claude)</b>\n\n"
         f"Задай любой вопрос — я постараюсь помочь!\n"
         f"📊 Осталось вопросов сегодня: <b>{remaining}/{AI_DAILY_LIMIT}</b>\n\n"
         f"Напиши свой вопрос 👇",
@@ -783,22 +782,16 @@ async def handle_ai_question(m: Message, state: FSMContext):
     used = get_ai_usage(m.from_user.id)
     if used >= AI_DAILY_LIMIT:
         return await m.answer(
-            f"😔 Лимит исчерпан. Приходи завтра!",
+            "😔 Лимит исчерпан. Приходи завтра!",
             reply_markup=main_menu(is_admin(m.from_user.id)),
         )
 
-    # Показываем что думаем
     thinking_msg = await m.answer("🤖 Думаю над ответом...")
-
-    # Запрос к Gemini
-    answer = await ask_gemini(m.text)
-
-    # Увеличиваем счётчик
+    answer = await ask_claude(m.text)
     increment_ai_usage(m.from_user.id)
     used_now = get_ai_usage(m.from_user.id)
     remaining = AI_DAILY_LIMIT - used_now
 
-    # Удаляем сообщение "думаю"
     try:
         await thinking_msg.delete()
     except Exception:
@@ -1007,34 +1000,34 @@ async def btn_admin_menu(m: Message):
     await m.answer(f"🛠 Админ-панель\n{status}", reply_markup=admin_menu())
 
 
-# --- Установить AI ключ ---
+# --- Установить Claude ключ ---
 @dp.message(F.text == "🔑 Установить AI ключ")
 async def btn_set_ai_key(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return await m.answer("❌ Нет прав.")
-    current = get_gemini_key()
-    masked = current[:8] + "..." if current and current != "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ" else "не установлен"
-    await state.set_state(SetGeminiKeyState.waiting_key)
+    current = get_claude_key()
+    masked = current[:12] + "..." if current and current != "СЮДА_СВОЙ_CLAUDE_КЛЮЧ" else "не установлен"
+    await state.set_state(SetClaudeKeyState.waiting_key)
     await m.answer(
-        f"🔑 <b>Установка Gemini API ключа</b>\n\n"
+        f"🔑 <b>Установка Claude API ключа</b>\n\n"
         f"Текущий ключ: <code>{masked}</code>\n\n"
-        f"Введи новый ключ (начинается с AIza...):",
+        f"Введи новый ключ (начинается с sk-ant-...):",
         reply_markup=cancel_menu(),
     )
 
 
-@dp.message(SetGeminiKeyState.waiting_key)
-async def receive_gemini_key(m: Message, state: FSMContext):
+@dp.message(SetClaudeKeyState.waiting_key)
+async def receive_claude_key(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         await state.clear()
         return
     key = m.text.strip()
-    if not key.startswith("AIza"):
-        return await m.answer("❌ Ключ должен начинаться с 'AIza...'. Попробуй ещё раз.")
-    set_setting("gemini_key", key)
+    if not key.startswith("sk-ant-"):
+        return await m.answer("❌ Ключ должен начинаться с 'sk-ant-...'. Попробуй ещё раз.")
+    set_setting("claude_key", key)
     await state.clear()
     await m.answer(
-        f"✅ Gemini API ключ успешно обновлён!\n<code>{key[:8]}...</code>",
+        f"✅ Claude API ключ успешно обновлён!\n<code>{key[:12]}...</code>",
         reply_markup=admin_menu(),
     )
 
@@ -1073,10 +1066,7 @@ async def btn_toggle_maintenance(m: Message):
             except Exception:
                 pass
             await asyncio.sleep(0.05)
-        await m.answer(
-            "✅ <b>Технические работы выключены!</b>",
-            reply_markup=admin_menu(),
-        )
+        await m.answer("✅ <b>Технические работы выключены!</b>", reply_markup=admin_menu())
 
 
 # --- Статистика ---
@@ -1092,8 +1082,8 @@ async def btn_stats(m: Message):
     notify_on = sum(1 for u in users if u["notify_enabled"] and not u["banned"])
     unanswered = len(get_unanswered_questions())
     maintenance = "🔧 Включены" if MAINTENANCE_MODE else "✅ Выключены"
-    ai_key = get_gemini_key()
-    ai_status = "✅ Установлен" if ai_key and ai_key != "СЮДА_СВОЙ_НОВЫЙ_КЛЮЧ" else "❌ Не установлен"
+    ai_key = get_claude_key()
+    ai_status = "✅ Установлен" if ai_key and ai_key != "СЮДА_СВОЙ_CLAUDE_КЛЮЧ" else "❌ Не установлен"
     txt = (
         f"📊 <b>Статистика бота</b>\n\n"
         f"👥 Всего пользователей: <b>{total}</b>\n"
@@ -1103,7 +1093,7 @@ async def btn_stats(m: Message):
         f"🔔 С уведомлениями: <b>{notify_on}</b>\n"
         f"💬 Неотвеченных вопросов: <b>{unanswered}</b>\n"
         f"🔧 Тех. работы: <b>{maintenance}</b>\n"
-        f"🤖 AI ключ: <b>{ai_status}</b>"
+        f"🤖 Claude ключ: <b>{ai_status}</b>"
     )
     await m.answer(txt, reply_markup=admin_menu())
 
@@ -1159,7 +1149,8 @@ async def btn_ban_start(m: Message, state: FSMContext):
     await state.set_state(BanState.waiting_name)
     kb_buttons = [[KeyboardButton(text=u["full_name"])] for u in active_users]
     kb_buttons.append([KeyboardButton(text="❌ Отмена")])
-    await m.answer("Выбери кого заблокировать:", reply_markup=ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True))
+    await m.answer("Выбери кого заблокировать:",
+                   reply_markup=ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True))
 
 
 @dp.message(BanState.waiting_name)
@@ -1194,7 +1185,8 @@ async def btn_unban_start(m: Message, state: FSMContext):
     await state.set_state(UnbanState.waiting_name)
     kb_buttons = [[KeyboardButton(text=u["full_name"])] for u in banned_users]
     kb_buttons.append([KeyboardButton(text="❌ Отмена")])
-    await m.answer("Выбери кого разблокировать:", reply_markup=ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True))
+    await m.answer("Выбери кого разблокировать:",
+                   reply_markup=ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True))
 
 
 @dp.message(UnbanState.waiting_name)
